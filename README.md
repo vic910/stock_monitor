@@ -1,0 +1,146 @@
+# 股票监控工具 stock_monitor
+
+A股/ETF/期指/港股实时监控桌面工具。支持多股票监控、MA均线状态、成交活跃度、置顶浮窗、系统托盘。
+
+---
+
+## 快速上手
+
+```bash
+python stock_monitor.py
+# 或直接运行
+dist\stock_monitor.exe
+```
+
+输入股票代码添加，右键行可加入浮窗或删除。
+
+---
+
+## 功能概览
+
+| 功能 | 说明 |
+|---|---|
+| 添加/删除股票 | 支持A股、ETF、期指、港股、恒生指数等任意代码 |
+| 实时价格 | 精确到小数点后4位 |
+| 涨跌幅 | 红涨绿跌（A股惯例） |
+| MA5/10/20/30 | 基于近80日K线自动计算并展示 |
+| 均线状态 | 股价在各均线上方/下方的综合描述，自动标色 |
+| 活跃度(N/M) | N日均量 / M日均量，N/M可在界面上自由设置并持久化 |
+| 自动刷新 | 可配置刷新间隔（秒），默认10秒 |
+| 常驻浮窗 | 支持任意数量股票，置顶显示，整体可拖动，最小化后仍保留 |
+| 系统托盘 | 最小化后缩至右下角托盘图标，双击恢复，右键退出 |
+| 配置持久化 | 股票列表/刷新间隔/N/M参数 自动保存 |
+
+---
+
+## 代码架构
+
+```
+stock_monitor.py
+├── search_secid(code)        # 东方财富搜索接口：code → (secid, name)，内存缓存
+├── _get_tencent_prefix(secid)# secid → 腾讯K线前缀（sh/sz/hk）
+├── fetch_stock_data(code)    # 腾讯K线接口：拉80日历史，返回价格/涨跌幅/MA5-60/成交量列表
+├── FloatWidget               # 置顶浮窗，支持任意数量股票，每行：价格  涨跌幅
+│   ├── _codes                # 有序列表，决定行顺序
+│   ├── _data                 # code → (price, change_pct, extra_text)
+│   ├── _rows                 # code → (price_lbl, chg_lbl) Label引用
+│   ├── _rebuild_rows()       # 增删股票时重建所有行（Label 透传鼠标事件，整体可拖）
+│   ├── _apply_data()         # 更新某行数据+背景色
+│   └── showEvent()           # 首次显示时设 WS_EX_TOOLWINDOW，不在任务栏出现
+├── FetchWorker(QThread)      # 后台线程，依次拉数据，signal 传给主线程
+└── MainWindow                # 主窗口
+    ├── _build_tray()         # 系统托盘图标+右键菜单
+    ├── changeEvent()         # 最小化 → hide()，浮窗不受影响
+    ├── closeEvent()          # 点叉 → 直接退出
+    ├── _on_vol_param_changed()# N/M 变更时保存配置
+    ├── _on_result()          # 收到数据→更新表格→计算活跃度→同步浮窗
+    └── _table_context_menu() # 右键菜单：加入/移出浮窗、删除
+```
+
+---
+
+## 数据接口
+
+| 用途 | 接口 | 备注 |
+|---|---|---|
+| 代码搜索/secid | `searchapi.eastmoney.com/api/suggest/get` | 东方财富，支持任意代码格式 |
+| 历史K线/均线/成交量 | `web.ifzq.gtimg.cn/appstock/app/fqkline/get` | 腾讯财经，前复权日K |
+| （备用）东方财富K线 | `push2his.eastmoney.com/api/qt/stock/kline/get` | 偶发断线，目前使用腾讯 |
+
+> K线格式：`[日期, 开, 收, 高, 低, 成交量, ...]`，收盘价索引2，成交量索引5。
+
+---
+
+## 均线状态列
+
+表格第9列，显示当前股价与 MA5/MA10/MA20/MA30 的位置关系：
+
+| 显示文字 | 含义 | 颜色 |
+|---|---|---|
+| 均线全上方 | 股价在 MA5/10/20/30 全部上方 | 红（强势） |
+| 均线全下方 | 股价在 MA5/10/20/30 全部下方 | 绿（弱势） |
+| 上方MA5↑MA10  下方MA20↓MA30 | 混合（示例） | 橙 |
+
+> MA60 不在表格中显示，内部仍用于行背景色判断。
+
+---
+
+## 活跃度列
+
+表格第10列，公式：`活跃度 = N日均量 / M日均量`
+
+N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保存。
+
+| 数值 | 含义 | 颜色 |
+|---|---|---|
+| ≥ 2.0x | 明显放量 | 红 |
+| 1.2~2.0x | 轻微放量 | 橙 |
+| 1.0~1.2x | 正常 | 灰 |
+| < 1.0x | 缩量 | 绿 |
+
+---
+
+## 代码格式说明
+
+| 品种 | 代码示例 | 说明 |
+|---|---|---|
+| 沪市A股 | `600519` | secid MktNum=1 |
+| 深市/创业板 | `000001` `300750` | secid MktNum=0 |
+| ETF | `159995` `510300` | 同深市规则 |
+| 富时A50期指 | `CN00Y` | 两个零！MktNum=104 |
+| 港股 | `00700` | 腾讯控股，MktNum=116，输入五位数字代码 |
+| 恒生指数 | `HSI` | MktNum=100 |
+
+---
+
+## 配置文件
+
+`stock_monitor_config.json`（自动生成，也可手动编辑）：
+
+```json
+{
+    "stocks": ["600519", "159995", "CN00Y", "00700", "HSI"],
+    "interval": 10,
+    "vol_n": 5,
+    "vol_m": 20
+}
+```
+
+---
+
+## 打包
+
+```bash
+python -m PyInstaller --onefile --windowed --name stock_monitor stock_monitor.py
+# 输出: dist\stock_monitor.exe
+```
+
+---
+
+## 扩展方向
+
+**加技术指标（MACD/RSI）**：在 `fetch_stock_data()` 里用 `closes` 列表计算，加返回值，`_on_result()` 里加列
+
+**成本价/盈亏**：config 里加 `cost_prices: {"600519": 1600}`，`_on_result()` 里加"盈亏%"列
+
+**K线图**：双击行弹窗，`fetch_stock_data()` 改为同时返回 `closes` 列表，用 `matplotlib` 画图
