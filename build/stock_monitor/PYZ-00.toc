@@ -1,4 +1,4 @@
-('E:\\hetaoscratch2d_all\\trunk_teacher_live_vscode\\HetaoScratch2D\\dev_tools\\stock_monitor\\build\\stock_monitor\\PYZ-00.pyz',
+('E:\\GitHub\\stock_monitor\\build\\stock_monitor\\PYZ-00.pyz',
  [('PyQt6',
    'C:\\Users\\admin\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\PyQt6\\__init__.py',
    'PYMODULE'),

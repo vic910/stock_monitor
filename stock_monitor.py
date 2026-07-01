@@ -147,7 +147,7 @@ def fetch_stock_data(code):
     def ma(n):
         return sum(closes[-n:]) / min(n, len(closes))
 
-    return name, current, change_pct, ma(5), ma(10), ma(20), ma(30), ma(60), volumes
+    return name, current, change_pct, ma(5), ma(10), ma(20), ma(30), ma(60), volumes, closes
 
 
 class FloatWidget(QWidget):
@@ -304,11 +304,10 @@ class FloatWidget(QWidget):
 
 class FetchWorker(QThread):
     """后台线程，依次拉取每只股票数据，通过 signal 通知主线程更新 UI
-    result signal: (code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes_json)
-      volumes_json: JSON字符串，主线程解析后计算活跃度比值
+    result signal: (code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60, vols_json, closes_json)
     error  signal: (code, error_msg)
     """
-    result = pyqtSignal(str, str, float, float, float, float, float, float, float, str)
+    result = pyqtSignal(str, str, float, float, float, float, float, float, float, str, str)
     error = pyqtSignal(str, str)
 
     def __init__(self, codes):
@@ -318,9 +317,9 @@ class FetchWorker(QThread):
     def run(self):
         for code in self.codes:
             try:
-                name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes = fetch_stock_data(code)
+                name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes = fetch_stock_data(code)
                 self.result.emit(code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60,
-                                 json.dumps(volumes))
+                                 json.dumps(volumes), json.dumps(closes))
             except Exception as e:
                 self.error.emit(code, str(e))
 
@@ -396,12 +395,12 @@ class MainWindow(QMainWindow):
         top.addWidget(self.refresh_btn)
         layout.addLayout(top)
 
-        # 数据表格，列：代码/名称/最新价/涨跌幅/MA5/MA10/MA20/MA30/均线状态/活跃度
+        # 数据表格，列：代码/名称/最新价/涨跌幅/趋势/均线状态/活跃度
         self.table = QTableWidget()
-        self.table.setColumnCount(10)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "MA5", "MA10", "MA20", "MA30", "均线状态", "活跃度(N/M)"])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "趋势", "均线状态", "活跃度(N/M)"])
         h = self.table.horizontalHeader()
-        for i in range(10):
+        for i in range(7):
             h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -466,7 +465,7 @@ class MainWindow(QMainWindow):
     def _insert_row(self, code):
         r = self.table.rowCount()
         self.table.insertRow(r)
-        for c, text in enumerate([code, "--", "--", "--", "--", "--", "--", "--", "--", "--"]):
+        for c, text in enumerate([code, "--", "--", "--", "--", "--", "--"]):
             self.table.setItem(r, c, QTableWidgetItem(text))
 
     def _add_stock(self):
@@ -535,26 +534,49 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.status_label.setText(f"上次刷新: {time.strftime('%H:%M:%S')}")
 
-    def _on_result(self, code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes_json):
+    def _on_result(self, code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60, vols_json, closes_json):
         for r in range(self.table.rowCount()):
             if self.table.item(r, 0).text() != code:
                 continue
 
-            # 均线状态：各周期上方/下方
-            ma_items = [("MA5", ma5), ("MA10", ma10), ("MA20", ma20), ("MA30", ma30)]
-            above = [n for n, v in ma_items if price >= v]
-            below = [n for n, v in ma_items if price < v]
-            if above and not below:
-                ma_status = "均线全上方"
-            elif below and not above:
-                ma_status = "均线全下方"
-            elif above:
-                ma_status = f"上方{'↑'.join(above)}  下方{'↓'.join(below)}"
-            else:
-                ma_status = "--"
+            closes = json.loads(closes_json)
+            vols   = json.loads(vols_json)
 
-            # 活跃度：N日均量 / M日均量
-            vols = json.loads(volumes_json)
+            # ── 算法4：综合趋势强度 ──────────────────────────────
+            # 维度1(40%)：均线得分，股价在几条均线上方
+            ma_list = [ma5, ma10, ma20, ma30]
+            ma_score = sum(1 for v in ma_list if price >= v) / 4.0  # 0~1
+
+            # 维度2(30%)：MA20斜率方向
+            if len(closes) >= 25:
+                ma20_now  = sum(closes[-20:]) / 20
+                ma20_prev = sum(closes[-25:-5]) / 20
+                slope_score = 1.0 if ma20_now > ma20_prev else 0.0
+            else:
+                slope_score = 0.5
+
+            # 维度3(30%)：高低点结构（取最近15根K线的首尾斜率）
+            if len(closes) >= 15:
+                seg = closes[-15:]
+                slope_h = seg[-1] - seg[0]
+                structure_score = 1.0 if slope_h > 0 else 0.0
+            else:
+                structure_score = 0.5
+
+            trend_score = ma_score * 0.4 + slope_score * 0.3 + structure_score * 0.3
+
+            if trend_score >= 0.85:
+                trend_text, trend_fg = "强势↑", QColor("#e74c3c")
+            elif trend_score >= 0.6:
+                trend_text, trend_fg = "偏多↗", QColor("#e74c3c")
+            elif trend_score >= 0.4:
+                trend_text, trend_fg = "震荡→", QColor("#888888")
+            elif trend_score >= 0.15:
+                trend_text, trend_fg = "偏空↘", QColor("#27ae60")
+            else:
+                trend_text, trend_fg = "弱势↓", QColor("#27ae60")
+
+            # ── 活跃度：N日均量 / M日均量 ──────────────────────
             vol_n = self.vol_n_spin.value()
             vol_m = self.vol_m_spin.value()
             def vol_avg(n):
@@ -565,39 +587,40 @@ class MainWindow(QMainWindow):
                 vol_ratio = avg_n / avg_m
                 vol_text = f"{vol_ratio:.2f}x"
                 if vol_ratio >= 2.0:
-                    vol_fg = QColor("#e74c3c")   # 明显放量 → 红
+                    vol_fg = QColor("#e74c3c")
                 elif vol_ratio >= 1.2:
-                    vol_fg = QColor("#e67e22")   # 轻微放量 → 橙
+                    vol_fg = QColor("#e67e22")
                 elif vol_ratio >= 1.0:
-                    vol_fg = QColor("#888888")   # 正常 → 灰
+                    vol_fg = QColor("#888888")
                 else:
-                    vol_fg = QColor("#27ae60")   # 缩量 → 绿
+                    vol_fg = QColor("#27ae60")
             else:
                 vol_text, vol_fg = "--", None
 
-            bg = QColor("#ffffff")
-
-            # 均线状态颜色
+            # ── 均线状态：股价在各均线上方/下方 ────────────────
+            ma_items = [("MA5", ma5), ("MA10", ma10), ("MA20", ma20), ("MA30", ma30)]
+            above = [n for n, v in ma_items if price >= v]
+            below = [n for n, v in ma_items if price < v]
             if above and not below:
-                ma_fg = QColor("#e74c3c")
+                ma_status, ma_fg = "均线全上方", QColor("#e74c3c")
             elif below and not above:
-                ma_fg = QColor("#27ae60")
-            else:
+                ma_status, ma_fg = "均线全下方", QColor("#27ae60")
+            elif above:
+                ma_status = f"上方{'/'.join(above)}  下方{'/'.join(below)}"
                 ma_fg = QColor("#e67e22")
+            else:
+                ma_status, ma_fg = "--", None
 
-            # 涨跌幅颜色（A股：红涨绿跌）
+            bg = QColor("#ffffff")
             chg_fg = QColor("#e74c3c") if change_pct > 0 else (QColor("#27ae60") if change_pct < 0 else None)
 
             updates = {
                 1: (name, None),
                 2: (f"{price:.4f}", None),
                 3: (f"{change_pct:+.2f}%", chg_fg),
-                4: (f"{ma5:.4f}", None),
-                5: (f"{ma10:.4f}", None),
-                6: (f"{ma20:.4f}", None),
-                7: (f"{ma30:.4f}", None),
-                8: (ma_status, ma_fg),
-                9: (vol_text, vol_fg),
+                4: (trend_text, trend_fg),
+                5: (ma_status, ma_fg),
+                6: (vol_text, vol_fg),
             }
             for c, (text, fg) in updates.items():
                 item = QTableWidgetItem(text)
@@ -609,7 +632,7 @@ class MainWindow(QMainWindow):
 
             # 同步浮窗
             if self._float_win.has_stock(code):
-                self._float_win.update_stock(code, price, change_pct, vol_text)
+                self._float_win.update_stock(code, price, change_pct, trend_text)
             break
 
     def _table_context_menu(self, pos):
@@ -651,7 +674,7 @@ class MainWindow(QMainWindow):
             if self.table.item(r, 0).text() == code:
                 item = QTableWidgetItem(f"获取失败: {msg}")
                 item.setForeground(QColor("#999999"))
-                self.table.setItem(r, 9, item)
+                self.table.setItem(r, 6, item)
                 break
 
     def _push_weixin(self, code, name, price, change_pct, risks, ma_status=""):
