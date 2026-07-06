@@ -164,7 +164,7 @@ class FloatWidget(QWidget):
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._drag_pos = None
         self._codes = []
         self._data = {}
@@ -174,7 +174,7 @@ class FloatWidget(QWidget):
         self._main_layout.setContentsMargins(8, 6, 8, 6)
         self._main_layout.setSpacing(3)
 
-        self._bg_color = "#2c3e50"
+        self._bg_color = "#888888"
         self._update_style()
 
     def showEvent(self, event):
@@ -194,7 +194,7 @@ class FloatWidget(QWidget):
 
     def _update_style(self):
         self.setStyleSheet(f"""
-            QWidget {{
+            FloatWidget {{
                 background-color: {self._bg_color};
                 border-radius: 7px;
             }}
@@ -251,16 +251,7 @@ class FloatWidget(QWidget):
             chg_lbl.setText(f"{change_pct:.2f}%")
             chg_lbl.setStyleSheet("color: white; background: transparent;")
 
-        # 背景取所有已有股票里最严重的风险等级
-        worst = "#2c3e50"
-        for c in self._codes:
-            r = self._data.get(c, (0, 0, ""))[2]
-            if "MA60" in r:
-                worst = "#7f1d1d"
-                break
-            elif r and r != "正常":
-                worst = "#7c4a00"
-        self._bg_color = worst
+        self._bg_color = "#888888"
         self._update_style()
 
     def add_stock(self, code):
