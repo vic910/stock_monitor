@@ -388,10 +388,10 @@ class MainWindow(QMainWindow):
 
         # 数据表格，列：代码/名称/最新价/涨跌幅/趋势/均线状态/活跃度
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "趋势", "均线状态", "活跃度(N/M)"])
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "趋势", "均线状态", "活跃度(N/M)", "排序"])
         h = self.table.horizontalHeader()
-        for i in range(7):
+        for i in range(8):
             h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -458,6 +458,40 @@ class MainWindow(QMainWindow):
         self.table.insertRow(r)
         for c, text in enumerate([code, "--", "--", "--", "--", "--", "--"]):
             self.table.setItem(r, c, QTableWidgetItem(text))
+        self._set_sort_buttons(r)
+
+    def _set_sort_buttons(self, row):
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(2)
+        btn_up = QPushButton("↑")
+        btn_dn = QPushButton("↓")
+        btn_up.setFixedSize(24, 20)
+        btn_dn.setFixedSize(24, 20)
+        btn_up.clicked.connect(lambda: self._move_row(self._widget_row(w), -1))
+        btn_dn.clicked.connect(lambda: self._move_row(self._widget_row(w), 1))
+        lay.addWidget(btn_up)
+        lay.addWidget(btn_dn)
+        self.table.setCellWidget(row, 7, w)
+
+    def _widget_row(self, widget):
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, 7) == widget:
+                return r
+        return -1
+
+    def _move_row(self, row, direction):
+        target = row + direction
+        if target < 0 or target >= self.table.rowCount():
+            return
+        for c in range(7):
+            a = self.table.takeItem(row, c)
+            b = self.table.takeItem(target, c)
+            self.table.setItem(row, c, b)
+            self.table.setItem(target, c, a)
+        self.table.setCurrentCell(target, 0)
+        self._save_stocks()
 
     def _add_stock(self):
         code = self.code_input.text().strip().upper()
@@ -485,6 +519,9 @@ class MainWindow(QMainWindow):
     def _save_stocks(self):
         self.config["stocks"] = [self.table.item(r, 0).text() for r in range(self.table.rowCount())]
         save_config(self.config)
+
+    def _on_rows_moved(self):
+        self._save_stocks()
 
     def _on_interval_changed(self, val):
         self.config["interval"] = val
