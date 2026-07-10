@@ -10,7 +10,7 @@
 
 数据接口（如接口挂了看这里换）：
   - 代码搜索: https://searchapi.eastmoney.com/api/suggest/get
-  - K线历史: https://push2his.eastmoney.com/api/qt/stock/kline/get (东方财富)
+  - K线历史: https://push2his.eastmoney.com/api/qt/stock/kline/get (东方财富，保留3位小数)
     支持 A股/ETF/期指/港股/恒生指数，secid 格式由搜索接口返回自动适配
   - 微信推送: https://sctapi.ftqq.com/{key}.send  (Server酱)
 
@@ -95,49 +95,36 @@ def search_secid(code):
     return secid, name
 
 
-def _get_tencent_prefix(secid):
-    """secid → 腾讯接口前缀，支持 A股(0/1)、港股(116)、恒生指数(100)"""
-    mkt, code = secid.split(".", 1)
-    if mkt == "1":
-        return f"sh{code}"
-    elif mkt in ("116", "100"):
-        return f"hk{code}"
-    else:
-        return f"sz{code}"
-
-
 def fetch_stock_data(code):
-    """拉取单只股票数据，返回 (name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes)
-    使用腾讯K线接口，支持 A股/ETF/期指/港股/恒生指数。
-    K线格式: [日期, 开, 收, 高, 低, 成交量, ...]
-    K线取最近80日，change_pct = (今收 - 昨收) / 昨收 * 100
+    """拉取单只股票数据，返回 (name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes)
+    使用东方财富K线接口（fields5=成交量, klt=101日线, fqt=1前复权）
+    K线字段: 日期,开,收,高,低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
     """
     secid, name = search_secid(code)
-    tc = _get_tencent_prefix(secid)
-
     url = (
-        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-        f"?_var=kline_day&param={tc},day,,,80,qfq"
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        f"?secid={secid}&fields1=f1,f2,f3,f4,f5&fields2=f51,f52,f53,f54,f55,f56"
+        "&klt=101&fqt=1&lmt=80&end=20500101"
     )
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://gu.qq.com/",
+        "Referer": "https://www.eastmoney.com/",
     })
     with urllib.request.urlopen(req, timeout=10) as resp:
-        raw = resp.read().decode("utf-8")
+        data = json.loads(resp.read().decode("utf-8"))
 
-    data = json.loads(raw[raw.index("=") + 1:])
-    stock_data = (data.get("data") or {}).get(tc, {})
-    klines = stock_data.get("day") or stock_data.get("qfqday") or []
+    klines = (data.get("data") or {}).get("klines") or []
     if not klines:
         raise Exception("无K线数据（代码有误或停牌）")
 
-    closes = [float(k[2]) for k in klines]
+    closes = []
     volumes = []
     for k in klines:
+        parts = k.split(",")
+        closes.append(float(parts[2]))
         try:
-            volumes.append(float(k[5]))
-        except (IndexError, ValueError, TypeError):
+            volumes.append(float(parts[5]))
+        except (IndexError, ValueError):
             volumes.append(0.0)
 
     current = closes[-1]

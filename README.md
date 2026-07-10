@@ -21,7 +21,7 @@ dist\stock_monitor.exe
 | 功能 | 说明 |
 |---|---|
 | 添加/删除股票 | 支持A股、ETF、期指、港股、恒生指数等任意代码 |
-| 实时价格 | 精确到小数点后4位 |
+| 实时价格 | 精确到小数点后3位（东方财富接口原生精度） |
 | 涨跌幅 | 红涨绿跌（A股惯例） |
 | 趋势（算法4） | 综合均线位置、MA20斜率、价格结构，输出5档强弱判断 |
 | 均线状态 | 股价与MA5/10/20/30的位置关系，全上方/全下方/混合，自动标色 |
@@ -103,9 +103,8 @@ N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保
 ```
 stock_monitor.py
 ├── search_secid(code)         # 东方财富搜索接口：code → (secid, name)，内存缓存
-├── _get_tencent_prefix(secid) # secid → 腾讯K线前缀（sh/sz/hk）
-├── fetch_stock_data(code)     # 腾讯K线接口：拉80日历史，返回价格/涨跌幅/MA5-60/成交量/收盘价列表
-├── FloatWidget                # 置顶浮窗，灰色背景(#888888)，支持任意数量股票，每行：价格  涨跌幅
+├── fetch_stock_data(code)     # 东方财富K线接口：拉80日历史，返回价格/涨跌幅/MA5-60/成交量/收盘价列表
+├── FloatWidget                # 置顶浮窗，支持任意数量股票，每行：价格  涨跌幅
 │   ├── _rebuild_rows()        # 增删股票时重建所有行（Label 透传鼠标事件，整体可拖）
 │   ├── _apply_data()          # 更新某行数据
 │   └── showEvent()            # 首次显示时设 WS_EX_TOOLWINDOW，不在任务栏出现
@@ -127,10 +126,9 @@ stock_monitor.py
 | 用途 | 接口 | 备注 |
 |---|---|---|
 | 代码搜索/secid | `searchapi.eastmoney.com/api/suggest/get` | 东方财富，支持任意代码格式 |
-| 历史K线/均线/成交量 | `web.ifzq.gtimg.cn/appstock/app/fqkline/get` | 腾讯财经，前复权日K |
-| （备用）东方财富K线 | `push2his.eastmoney.com/api/qt/stock/kline/get` | 偶发断线，目前使用腾讯 |
+| 历史K线/均线/成交量 | `push2his.eastmoney.com/api/qt/stock/kline/get` | 东方财富，前复权日K，3位小数精度 |
 
-> K线格式：`[日期, 开, 收, 高, 低, 成交量, ...]`，收盘价索引2，成交量索引5。
+> K线字段（逗号分隔）：`日期,开,收,高,低,成交量,...`，收盘价索引2，成交量索引5。
 
 ---
 
