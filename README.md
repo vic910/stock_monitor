@@ -47,7 +47,7 @@ dist\stock_monitor.exe
 | 趋势 | 算法4综合趋势强度（见下节） |
 | 活跃度(N/M) | N日均量/M日均量（见下节） |
 | 做T策略 | 股价与MA10位置关系，指导做T方向（见下节） |
-| 排序 | ↑↓ 按钮，调整行顺序 |
+| 排序 | ↑↓ 点击调整；⠿ 长按拖拽到目标行插入 |
 
 ---
 
@@ -121,7 +121,8 @@ stock_monitor.py
 ├── fetch_stock_data(code)     # 东方财富K线接口：拉80日历史，返回价格/涨跌幅/MA5-60/成交量/收盘价列表
 ├── FloatWidget                # 置顶浮窗，支持任意数量股票，每行：价格  涨跌幅
 │   ├── _rebuild_rows()        # 增删股票时重建所有行（Label 透传鼠标事件，整体可拖）
-│   ├── _apply_data()          # 更新某行数据
+│   ├── _apply_data()          # 更新某行数据（涨跌幅颜色跟随字体颜色设置）
+│   ├── _update_style()        # 应用背景色/字体颜色 stylesheet
 │   └── showEvent()            # 首次显示时设 WS_EX_TOOLWINDOW，不在任务栏出现
 ├── FetchWorker(QThread)       # 后台线程，依次拉数据，signal 传给主线程
 └── MainWindow                 # 主窗口
@@ -131,6 +132,7 @@ stock_monitor.py
     ├── _on_vol_param_changed()# N/M 变更时保存配置
     ├── _on_result()           # 收到数据→算法4趋势→活跃度→更新表格→同步浮窗
     ├── _move_row()            # ↑↓ 按钮回调：交换行内容并保存顺序
+    ├── _drag_move_row()       # ⠿ 拖拽按钮回调：删除源行并插入目标位置
     └── _table_context_menu()  # 右键菜单：加入/移出浮窗、删除
 ```
 
@@ -169,7 +171,9 @@ stock_monitor.py
     "stocks": ["600519", "159995", "CN00Y", "00700", "HSI"],
     "interval": 10,
     "vol_n": 5,
-    "vol_m": 20
+    "vol_m": 20,
+    "float_bg": "#2c3e50",
+    "float_font_color": "#ffffff"
 }
 ```
 
