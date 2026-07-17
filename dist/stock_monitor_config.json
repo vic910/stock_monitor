@@ -4,6 +4,7 @@
         "513050",
         "513120",
         "562500",
+        "159131",
         "510300",
         "600519",
         "HSI",
@@ -13,5 +14,6 @@
     "server_key": "",
     "vol_n": 5,
     "vol_m": 13,
-    "float_bg": "#afaaaa"
+    "float_bg": "#181818",
+    "float_font_color": "#acacac"
 }

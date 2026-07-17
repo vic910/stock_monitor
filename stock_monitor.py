@@ -157,8 +157,10 @@ class FloatWidget(QWidget):
     """
 
     color_changed = pyqtSignal(str)
+    font_color_changed = pyqtSignal(str)
+    cleared = pyqtSignal()
 
-    def __init__(self, bg_color="#2c3e50"):
+    def __init__(self, bg_color="#2c3e50", font_color="#ffffff"):
         super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
@@ -175,6 +177,7 @@ class FloatWidget(QWidget):
         self._main_layout.setSpacing(3)
 
         self._bg_color = bg_color
+        self._font_color = font_color
         self._update_style()
 
     def showEvent(self, event):
@@ -199,7 +202,7 @@ class FloatWidget(QWidget):
                 border-radius: 7px;
             }}
             QLabel {{
-                color: white;
+                color: {self._font_color};
                 background: transparent;
             }}
         """)
@@ -241,15 +244,14 @@ class FloatWidget(QWidget):
             return
         price_lbl, chg_lbl = self._rows[code]
         price_lbl.setText(f"{price:.4f}")
+        fc = self._font_color
         if change_pct > 0:
             chg_lbl.setText(f"{change_pct:+.2f}%")
-            chg_lbl.setStyleSheet("color: white; background: transparent;")
         elif change_pct < 0:
             chg_lbl.setText(f"{change_pct:.2f}%")
-            chg_lbl.setStyleSheet("color: white; background: transparent;")
         else:
             chg_lbl.setText(f"{change_pct:.2f}%")
-            chg_lbl.setStyleSheet("color: white; background: transparent;")
+        chg_lbl.setStyleSheet(f"color: {fc}; background: transparent;")
 
 
     def add_stock(self, code):
@@ -279,6 +281,7 @@ class FloatWidget(QWidget):
         elif event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
             act_color = menu.addAction("修改背景色...")
+            act_font_color = menu.addAction("修改字体颜色...")
             act_close = menu.addAction("关闭浮窗")
             act = menu.exec(QCursor.pos())
             if act == act_color:
@@ -287,7 +290,17 @@ class FloatWidget(QWidget):
                     self._bg_color = color.name()
                     self._update_style()
                     self.color_changed.emit(self._bg_color)
+            elif act == act_font_color:
+                color = QColorDialog.getColor(QColor(self._font_color), self, "选择浮窗字体颜色")
+                if color.isValid():
+                    self._font_color = color.name()
+                    self._update_style()
+                    self.font_color_changed.emit(self._font_color)
             elif act == act_close:
+                self._codes.clear()
+                self._data.clear()
+                self._rebuild_rows()
+                self.cleared.emit()
                 self.hide()
 
     def mouseMoveEvent(self, event):
@@ -328,8 +341,9 @@ class MainWindow(QMainWindow):
         self.config = load_config()
         self.worker = None
         self._last_push = {}      # code → 上次推送时间戳，限流用
-        self._float_win = FloatWidget(bg_color=self.config.get("float_bg", "#2c3e50"))
+        self._float_win = FloatWidget(bg_color=self.config.get("float_bg", "#2c3e50"), font_color=self.config.get("float_font_color", "#ffffff"))
         self._float_win.color_changed.connect(self._on_float_color_changed)
+        self._float_win.font_color_changed.connect(self._on_float_font_color_changed)
         self._build_ui()
         self._build_tray()
         self._start_timer()
@@ -554,6 +568,10 @@ class MainWindow(QMainWindow):
 
     def _on_float_color_changed(self, color):
         self.config["float_bg"] = color
+        save_config(self.config)
+
+    def _on_float_font_color_changed(self, color):
+        self.config["float_font_color"] = color
         save_config(self.config)
 
     def _start_timer(self):
