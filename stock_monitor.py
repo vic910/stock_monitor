@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QMessageBox, QSpinBox, QMenu, QSystemTrayIcon, QColorDialog
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint
-from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap
+from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap, QPainter, QPen
 
 # 打包后用 exe 所在目录，开发时用脚本所在目录
 if getattr(sys, 'frozen', False):
@@ -500,8 +500,78 @@ class MainWindow(QMainWindow):
         btn_dn.setFixedSize(24, 20)
         btn_up.clicked.connect(lambda: self._move_row(self._widget_row(w), -1))
         btn_dn.clicked.connect(lambda: self._move_row(self._widget_row(w), 1))
+        btn_drag = QPushButton("⠿")
+        btn_drag.setFixedSize(20, 20)
+        btn_drag.setToolTip("长按拖拽调整顺序")
+        btn_drag.setCursor(Qt.CursorShape.OpenHandCursor)
+        btn_drag.setStyleSheet("font-size:11px;")
+        # 拖拽状态
+        btn_drag._drag_start_pos = None
+        btn_drag._drag_active = False
+        btn_drag._drag_indicator = None
+
+        def on_press(event, _w=w):
+            if event.button() == Qt.MouseButton.LeftButton:
+                btn_drag._drag_start_pos = event.globalPosition().toPoint()
+                btn_drag._drag_active = False
+                # 长按300ms后激活拖拽
+                btn_drag._press_timer = QTimer()
+                btn_drag._press_timer.setSingleShot(True)
+                btn_drag._press_timer.timeout.connect(lambda: setattr(btn_drag, '_drag_active', True))
+                btn_drag._press_timer.start(300)
+
+        def on_move(event, _w=w):
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                return
+            if not btn_drag._drag_active:
+                return
+            btn_drag.setCursor(Qt.CursorShape.ClosedHandCursor)
+            gpos = event.globalPosition().toPoint()
+            tpos = self.table.viewport().mapFromGlobal(gpos)
+            target_row = self.table.rowAt(tpos.y())
+            # 绘制插入线指示
+            if btn_drag._drag_indicator is None:
+                btn_drag._drag_indicator = QWidget(self.table.viewport())
+                btn_drag._drag_indicator.setStyleSheet("background: #e74c3c;")
+                btn_drag._drag_indicator.setFixedHeight(2)
+                btn_drag._drag_indicator.show()
+            ind = btn_drag._drag_indicator
+            if target_row >= 0:
+                rect = self.table.visualItemRect(self.table.item(target_row, 0))
+                ind.setGeometry(0, rect.top(), self.table.viewport().width(), 2)
+            else:
+                n = self.table.rowCount()
+                if n > 0:
+                    rect = self.table.visualItemRect(self.table.item(n - 1, 0))
+                    ind.setGeometry(0, rect.bottom(), self.table.viewport().width(), 2)
+
+        def on_release(event, _w=w):
+            if hasattr(btn_drag, '_press_timer'):
+                btn_drag._press_timer.stop()
+            btn_drag.setCursor(Qt.CursorShape.OpenHandCursor)
+            if btn_drag._drag_indicator:
+                btn_drag._drag_indicator.deleteLater()
+                btn_drag._drag_indicator = None
+            if not btn_drag._drag_active:
+                btn_drag._drag_active = False
+                return
+            btn_drag._drag_active = False
+            gpos = event.globalPosition().toPoint()
+            tpos = self.table.viewport().mapFromGlobal(gpos)
+            src_row = self._widget_row(_w)
+            target_row = self.table.rowAt(tpos.y())
+            if target_row < 0:
+                target_row = self.table.rowCount() - 1
+            if src_row >= 0 and target_row != src_row:
+                self._drag_move_row(src_row, target_row)
+
+        btn_drag.mousePressEvent = on_press
+        btn_drag.mouseMoveEvent = on_move
+        btn_drag.mouseReleaseEvent = on_release
+
         lay.addWidget(btn_up)
         lay.addWidget(btn_dn)
+        lay.addWidget(btn_drag)
         self.table.setCellWidget(row, 8, w)
 
     def _widget_row(self, widget):
@@ -520,6 +590,21 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, c, b)
             self.table.setItem(target, c, a)
         self.table.setCurrentCell(target, 0)
+        self._save_stocks()
+
+    def _drag_move_row(self, src, dst):
+        if src == dst:
+            return
+        # 取出源行数据
+        items = [self.table.takeItem(src, c) for c in range(8)]
+        self.table.removeRow(src)
+        # dst 因删除后可能偏移
+        insert_at = dst if dst < src else dst
+        self.table.insertRow(insert_at)
+        for c, item in enumerate(items):
+            self.table.setItem(insert_at, c, item)
+        self._set_sort_buttons(insert_at)
+        self.table.setCurrentCell(insert_at, 0)
         self._save_stocks()
 
     def _add_stock(self):
