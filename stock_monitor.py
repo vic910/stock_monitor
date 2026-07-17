@@ -41,7 +41,7 @@ import urllib.parse
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
-    QHeaderView, QMessageBox, QSpinBox, QMenu, QSystemTrayIcon
+    QHeaderView, QMessageBox, QSpinBox, QMenu, QSystemTrayIcon, QColorDialog
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint
 from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap
@@ -95,36 +95,47 @@ def search_secid(code):
     return secid, name
 
 
+def _get_tencent_prefix(secid):
+    """secid → 腾讯接口前缀，支持 A股(0/1)、港股(116)、恒生指数(100)"""
+    mkt, code = secid.split(".", 1)
+    if mkt == "1":
+        return f"sh{code}"
+    elif mkt in ("116", "100"):
+        return f"hk{code}"
+    else:
+        return f"sz{code}"
+
+
 def fetch_stock_data(code):
     """拉取单只股票数据，返回 (name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes)
-    使用东方财富K线接口（fields5=成交量, klt=101日线, fqt=1前复权）
-    K线字段: 日期,开,收,高,低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+    使用腾讯K线接口，支持 A股/ETF/期指/港股/恒生指数。
+    K线格式: [日期, 开, 收, 高, 低, 成交量, ...]，收盘价索引2，成交量索引5
     """
     secid, name = search_secid(code)
+    tc = _get_tencent_prefix(secid)
     url = (
-        "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        f"?secid={secid}&fields1=f1,f2,f3,f4,f5&fields2=f51,f52,f53,f54,f55,f56"
-        "&klt=101&fqt=1&lmt=80&end=20500101"
+        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        f"?_var=kline_day&param={tc},day,,,80,qfq"
     )
     req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.eastmoney.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Referer": "https://gu.qq.com/",
     })
     with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+        raw = resp.read().decode("utf-8")
 
-    klines = (data.get("data") or {}).get("klines") or []
+    data = json.loads(raw[raw.index("=") + 1:])
+    stock_data = (data.get("data") or {}).get(tc, {})
+    klines = stock_data.get("day") or stock_data.get("qfqday") or []
     if not klines:
         raise Exception("无K线数据（代码有误或停牌）")
 
-    closes = []
+    closes = [float(k[2]) for k in klines]
     volumes = []
     for k in klines:
-        parts = k.split(",")
-        closes.append(float(parts[2]))
         try:
-            volumes.append(float(parts[5]))
-        except (IndexError, ValueError):
+            volumes.append(float(k[5]))
+        except (IndexError, ValueError, TypeError):
             volumes.append(0.0)
 
     current = closes[-1]
@@ -145,7 +156,9 @@ class FloatWidget(QWidget):
       _rows   : code → (price_lbl, chg_lbl)，当前显示的 Label 引用
     """
 
-    def __init__(self):
+    color_changed = pyqtSignal(str)
+
+    def __init__(self, bg_color="#2c3e50"):
         super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
@@ -161,7 +174,7 @@ class FloatWidget(QWidget):
         self._main_layout.setContentsMargins(8, 6, 8, 6)
         self._main_layout.setSpacing(3)
 
-        self._bg_color = "#888888"
+        self._bg_color = bg_color
         self._update_style()
 
     def showEvent(self, event):
@@ -238,8 +251,6 @@ class FloatWidget(QWidget):
             chg_lbl.setText(f"{change_pct:.2f}%")
             chg_lbl.setStyleSheet("color: white; background: transparent;")
 
-        self._bg_color = "#888888"
-        self._update_style()
 
     def add_stock(self, code):
         if code in self._codes:
@@ -267,9 +278,16 @@ class FloatWidget(QWidget):
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
         elif event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
+            act_color = menu.addAction("修改背景色...")
             act_close = menu.addAction("关闭浮窗")
             act = menu.exec(QCursor.pos())
-            if act == act_close:
+            if act == act_color:
+                color = QColorDialog.getColor(QColor(self._bg_color), self, "选择浮窗背景色")
+                if color.isValid():
+                    self._bg_color = color.name()
+                    self._update_style()
+                    self.color_changed.emit(self._bg_color)
+            elif act == act_close:
                 self.hide()
 
     def mouseMoveEvent(self, event):
@@ -310,7 +328,8 @@ class MainWindow(QMainWindow):
         self.config = load_config()
         self.worker = None
         self._last_push = {}      # code → 上次推送时间戳，限流用
-        self._float_win = FloatWidget()
+        self._float_win = FloatWidget(bg_color=self.config.get("float_bg", "#2c3e50"))
+        self._float_win.color_changed.connect(self._on_float_color_changed)
         self._build_ui()
         self._build_tray()
         self._start_timer()
@@ -522,6 +541,10 @@ class MainWindow(QMainWindow):
 
     def _save_server_key(self):
         self.config["server_key"] = self.key_input.text().strip()
+        save_config(self.config)
+
+    def _on_float_color_changed(self, color):
+        self.config["float_bg"] = color
         save_config(self.config)
 
     def _start_timer(self):
