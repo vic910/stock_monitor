@@ -394,11 +394,20 @@ class MainWindow(QMainWindow):
 
         # 数据表格，列：代码/名称/最新价/涨跌幅/趋势/均线状态/活跃度
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "趋势", "均线状态", "活跃度(N/M)", "排序"])
+        self.table.setColumnCount(9)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "均线状态", "趋势", "活跃度(N/M)", "做T策略", "排序"])
         h = self.table.horizontalHeader()
-        for i in range(8):
+        for i in range(9):
             h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        tooltips = {
+            5: "趋势（算法4）：综合均线位置(40%)、MA20斜率(30%)、价格结构(30%)加权评分\n强势↑ ≥0.85 | 偏多↗ 0.60~0.85 | 震荡→ 0.40~0.60 | 偏空↘ 0.15~0.40 | 弱势↓ <0.15",
+            6: "活跃度 = N日均量 / M日均量\n≥2.0x 明显放量(红) | 1.2~2.0x 轻微放量(橙) | 1.0~1.2x 正常(灰) | <1.0x 缩量(绿)",
+            7: "做T策略：股价 ≥ MA10 → 积极买进(红)\n股价 < MA10 → 积极卖出(绿)",
+        }
+        for col, tip in tooltips.items():
+            item = self.table.horizontalHeaderItem(col)
+            if item:
+                item.setToolTip(tip)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -462,7 +471,7 @@ class MainWindow(QMainWindow):
     def _insert_row(self, code):
         r = self.table.rowCount()
         self.table.insertRow(r)
-        for c, text in enumerate([code, "--", "--", "--", "--", "--", "--"]):
+        for c, text in enumerate([code, "--", "--", "--", "--", "--", "--", "--"]):
             self.table.setItem(r, c, QTableWidgetItem(text))
         self._set_sort_buttons(r)
 
@@ -479,11 +488,11 @@ class MainWindow(QMainWindow):
         btn_dn.clicked.connect(lambda: self._move_row(self._widget_row(w), 1))
         lay.addWidget(btn_up)
         lay.addWidget(btn_dn)
-        self.table.setCellWidget(row, 7, w)
+        self.table.setCellWidget(row, 8, w)
 
     def _widget_row(self, widget):
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 7) == widget:
+            if self.table.cellWidget(r, 8) == widget:
                 return r
         return -1
 
@@ -491,7 +500,7 @@ class MainWindow(QMainWindow):
         target = row + direction
         if target < 0 or target >= self.table.rowCount():
             return
-        for c in range(7):
+        for c in range(8):
             a = self.table.takeItem(row, c)
             b = self.table.takeItem(target, c)
             self.table.setItem(row, c, b)
@@ -649,6 +658,12 @@ class MainWindow(QMainWindow):
             else:
                 ma_status, ma_fg = "--", None
 
+            # ── 做T策略：股价与MA10位置关系 ──────────────────────
+            if price >= ma10:
+                t_text, t_fg = "积极买进", QColor("#e74c3c")
+            else:
+                t_text, t_fg = "积极卖出", QColor("#27ae60")
+
             bg = QColor("#ffffff")
             chg_fg = QColor("#e74c3c") if change_pct > 0 else (QColor("#27ae60") if change_pct < 0 else None)
 
@@ -656,9 +671,10 @@ class MainWindow(QMainWindow):
                 1: (name, None),
                 2: (f"{price:.4f}", None),
                 3: (f"{change_pct:+.2f}%", chg_fg),
-                4: (trend_text, trend_fg),
-                5: (ma_status, ma_fg),
+                4: (ma_status, ma_fg),
+                5: (trend_text, trend_fg),
                 6: (vol_text, vol_fg),
+                7: (t_text, t_fg),
             }
             for c, (text, fg) in updates.items():
                 item = QTableWidgetItem(text)
