@@ -2,32 +2,33 @@
 股票监控工具 stock_monitor.py
 ================================
 架构概览：
-  - search_secid()    : 东方财富搜索接口，code → (secid, name)，结果内存缓存
-  - fetch_stock_data(): 东方财富K线接口拉80日历史，计算最新价/涨跌幅/MA20/MA60
-  - FetchWorker       : QThread，遍历所有code依次拉数据，通过signal推给主线程
-  - FloatWidget       : 无边框置顶浮窗，最多3只股票，每只一行(价格+涨跌幅)
-  - MainWindow        : 主窗口，表格+定时刷新+右键菜单+底部推送配置
+  - search_secid()        : 东方财富搜索接口，code → (secid, name)，结果内存缓存
+  - _fetch_kline_tencent(): 腾讯K线接口（风控松，优先用），覆盖 A股/ETF/港股/恒指
+  - _fetch_kline_eastmoney(): 东方财富K线接口（secid直查，全品种但风控严），仅作期指等兜底
+  - fetch_stock_data()    : 组合上面两个K线源 + 实时价，返回最新价/涨跌幅/MA5-60/成交量/收盘价
+  - fetch_realtime_quote(): 腾讯实时行情接口，盘中拿高精度当天价/涨跌幅（取不到则降级）
+  - FetchWorker           : QThread，遍历所有code依次拉数据，通过signal推给主线程
+  - FloatWidget           : 无边框置顶浮窗，支持任意数量股票，每只一行(价格+涨跌幅)
+  - MainWindow            : 主窗口，表格+定时刷新+右键菜单+托盘
 
 数据接口（如接口挂了看这里换）：
-  - 代码搜索: https://searchapi.eastmoney.com/api/suggest/get
-  - K线历史: https://push2his.eastmoney.com/api/qt/stock/kline/get (东方财富，保留3位小数)
-    支持 A股/ETF/期指/港股/恒生指数，secid 格式由搜索接口返回自动适配
-  - 微信推送: https://sctapi.ftqq.com/{key}.send  (Server酱)
+  - 代码搜索: https://searchapi.eastmoney.com/api/suggest/get  (东方财富，任意代码 → secid)
+  - K线历史(主): https://web.ifzq.gtimg.cn/appstock/app/fqkline/get  (腾讯，前复权日K，风控松)
+  - K线历史(兜底): https://push2his.eastmoney.com/api/qt/stock/kline/get  (东方财富，secid直查，覆盖 A50 期指等)
+    腾讯取不到才用东财——东财 push2his 高频请求易触发限流，只留给期指等特殊品种
+  - 实时行情: https://qt.gtimg.cn/q={前缀+代码}  (腾讯，盘中高精度价，期指等不覆盖时降级用K线收盘价)
+  - 微信推送: https://sctapi.ftqq.com/{key}.send  (Server酱，_push_weixin 已封装但当前未接入)
 
-风险判断规则（在 MainWindow._on_result 里）：
-  - price < MA60  → 跌破MA60 ⚠⚠（红色）
-  - price < MA20  → 跌破MA20 ⚠（橙色）
-  - 涨跌幅 <= -3% → 单日跌幅提示（橙色）
-  - 涨跌幅 >= 7%  → 单日涨幅追高提示（橙色）
-
-浮窗背景色规则（在 FloatWidget._apply_data 里）：
-  - 有 MA60 风险 → #7f1d1d（暗红）
-  - 有其他风险   → #7c4a00（橙红）
-  - 正常          → #2c3e50（深色）
+表格各列的计算规则（在 MainWindow._on_result 里）：
+  - 趋势(算法4): 均线位置(40%) + MA20斜率(30%) + 价格结构(30%) 加权评分，5档强弱
+  - 均线状态   : 股价与 MA5/10/20/30 的上下方位置关系
+  - 活跃度(N/M): N日均量 / M日均量，N、M 可在界面设置
+  - 做T策略    : 股价 ≥ MA10 → 积极买进，< MA10 → 积极卖出
 
 扩展方向：
+  - 微信/风险推送: 实现风险判断 → _last_push 限流 → _push_weixin（建议放子线程）
   - 更多技术指标（MACD/RSI）: 在 fetch_stock_data() 里用 closes 列表扩展计算
-  - 成本价/盈亏: config 里加 cost_price 字段，_on_result 里加列展示
+  - 成本价/盈亏: config 里加 cost_prices 字段，_on_result 里加列展示
   - K线图: 双击行弹窗，用 matplotlib 画 closes 折线
 """
 
@@ -43,7 +44,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QSpinBox, QMenu, QSystemTrayIcon, QColorDialog
 )
-from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint
+from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint, QEvent
 from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap, QPainter, QPen
 
 # 打包后用 exe 所在目录，开发时用脚本所在目录
@@ -106,13 +107,39 @@ def _get_tencent_prefix(secid):
         return f"sz{code}"
 
 
-def fetch_stock_data(code):
-    """拉取单只股票数据，返回 (name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes)
-    使用腾讯K线接口，支持 A股/ETF/期指/港股/恒生指数。
-    K线格式: [日期, 开, 收, 高, 低, 成交量, ...]，收盘价索引2，成交量索引5
+def fetch_realtime_quote(tc):
+    """腾讯实时行情接口：tc(如 sz159995) → (price, change_pct)，取不到返回 None
+
+    盘中 K线接口当天那根收盘价只有 2 位精度（如 1.26），实时接口给 3 位（1.265），
+    且涨跌幅用真实昨收计算。期指等特殊品种此接口不覆盖，返回 None 由调用方降级。
+    字段(~分隔): 索引3=当前价, 索引4=昨收, 索引32=涨跌幅
     """
-    secid, name = search_secid(code)
-    tc = _get_tencent_prefix(secid)
+    try:
+        url = f"https://qt.gtimg.cn/q={tc}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://gu.qq.com/",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("gbk", errors="ignore")
+        if '="' not in raw:
+            return None
+        body = raw.split('="', 1)[1].rsplit('";', 1)[0]
+        f = body.split("~")
+        if len(f) <= 32 or not f[3]:
+            return None
+        price = float(f[3])
+        change_pct = float(f[32]) if f[32] else 0.0
+        return price, change_pct
+    except Exception:
+        return None
+
+
+def _fetch_kline_tencent(tc):
+    """腾讯K线接口：tc(如 sz159995) → (closes, volumes)，风控较松，覆盖 A股/ETF/港股/恒指。
+    境外期指(如 A50)不覆盖，返回 None 由调用方转东财兜底。
+    K线格式(数组): [日期, 开, 收, 高, 低, 成交量, ...]，收盘索引2，成交量索引5
+    """
     url = (
         f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
         f"?_var=kline_day&param={tc},day,,,80,qfq"
@@ -123,13 +150,11 @@ def fetch_stock_data(code):
     })
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw = resp.read().decode("utf-8")
-
     data = json.loads(raw[raw.index("=") + 1:])
-    stock_data = (data.get("data") or {}).get(tc, {})
-    klines = stock_data.get("day") or stock_data.get("qfqday") or []
+    sd = (data.get("data") or {}).get(tc, {})
+    klines = sd.get("day") or sd.get("qfqday") or []
     if not klines:
-        raise Exception("无K线数据（代码有误或停牌）")
-
+        return None
     closes = [float(k[2]) for k in klines]
     volumes = []
     for k in klines:
@@ -137,10 +162,72 @@ def fetch_stock_data(code):
             volumes.append(float(k[5]))
         except (IndexError, ValueError, TypeError):
             volumes.append(0.0)
+    return closes, volumes
+
+
+def _fetch_kline_eastmoney(secid):
+    """东方财富K线接口：secid 直查 → (closes, volumes, name)，全品种覆盖但风控严，仅作兜底。
+    K线格式(逗号分隔): 日期,开,收,高,低,成交量,成交额，收盘索引2，成交量索引5
+    """
+    url = (
+        f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        f"?secid={secid}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57"
+        f"&klt=101&fqt=1&end=20500101&lmt=80"
+    )
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Referer": "https://www.eastmoney.com/",
+    })
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read().decode("utf-8")
+    data = json.loads(raw).get("data") or {}
+    klines = data.get("klines") or []
+    if not klines:
+        return None
+    rows = [k.split(",") for k in klines]
+    closes = [float(r[2]) for r in rows]
+    volumes = []
+    for r in rows:
+        try:
+            volumes.append(float(r[5]))
+        except (IndexError, ValueError, TypeError):
+            volumes.append(0.0)
+    return closes, volumes, data.get("name")
+
+
+def fetch_stock_data(code):
+    """拉取单只股票数据，返回 (name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes)
+
+    K线来源：优先腾讯（风控松，覆盖 A股/ETF/港股/恒指），腾讯取不到再降级东方财富
+    （secid 直查，覆盖 A50 等境外期指）。避免东财 push2his 高频请求触发限流。
+
+    价格精度：均线/趋势/成交量全部基于 K线收盘价计算；当天最新价和涨跌幅优先取
+    腾讯实时行情接口（高精度），取不到时降级用 K线收盘价（期指等特殊品种走此分支）。
+    """
+    secid, name = search_secid(code)
+    tc = _get_tencent_prefix(secid)
+
+    result = _fetch_kline_tencent(tc)     # 优先腾讯
+    if result is not None:
+        closes, volumes = result
+    else:
+        em = _fetch_kline_eastmoney(secid)   # 期指等降级东财
+        if em is None:
+            raise Exception("无K线数据（代码有误或停牌）")
+        closes, volumes, em_name = em
+        if em_name:
+            name = em_name
 
     current = closes[-1]
     prev = closes[-2] if len(closes) > 1 else current
     change_pct = (current - prev) / prev * 100 if prev else 0
+
+    # 用腾讯实时行情覆盖当天最新价/涨跌幅（高精度），并同步 closes[-1] 使均线口径一致；
+    # 取不到（如期指，腾讯实时接口不覆盖）则保持 K线收盘价不变
+    rt = fetch_realtime_quote(tc)
+    if rt is not None:
+        current, change_pct = rt
+        closes[-1] = current
 
     def ma(n):
         return sum(closes[-n:]) / min(n, len(closes))
@@ -152,7 +239,7 @@ class FloatWidget(QWidget):
     """常驻最顶层浮窗，支持任意数量股票，每行：价格  涨跌幅
     内部状态：
       _codes  : 有序列表，决定行的显示顺序
-      _data   : code → (price, change_pct, risk_text)，用于重建行时恢复数据
+      _data   : code → (price, change_pct)，用于重建行时恢复数据
       _rows   : code → (price_lbl, chg_lbl)，当前显示的 Label 引用
     """
 
@@ -238,8 +325,8 @@ class FloatWidget(QWidget):
 
         self.adjustSize()
 
-    def _apply_data(self, code, price, change_pct, risk_text):
-        """把数据写入对应行的 Label，并更新整体背景色（取最严重风险）"""
+    def _apply_data(self, code, price, change_pct):
+        """把数据写入对应行的 Label（价格 + 涨跌幅）"""
         if code not in self._rows:
             return
         price_lbl, chg_lbl = self._rows[code]
@@ -267,9 +354,9 @@ class FloatWidget(QWidget):
         self._data.pop(code, None)
         self._rebuild_rows()
 
-    def update_stock(self, code, price, change_pct, risk_text):
-        self._data[code] = (price, change_pct, risk_text)
-        self._apply_data(code, price, change_pct, risk_text)
+    def update_stock(self, code, price, change_pct):
+        self._data[code] = (price, change_pct)
+        self._apply_data(code, price, change_pct)
         self.adjustSize()
 
     def has_stock(self, code):
@@ -340,7 +427,6 @@ class MainWindow(QMainWindow):
         self.resize(960, 520)
         self.config = load_config()
         self.worker = None
-        self._last_push = {}      # code → 上次推送时间戳，限流用
         self._float_win = FloatWidget(bg_color=self.config.get("float_bg", "#2c3e50"), font_color=self.config.get("float_font_color", "#ffffff"))
         self._float_win.color_changed.connect(self._on_float_color_changed)
         self._float_win.font_color_changed.connect(self._on_float_font_color_changed)
@@ -433,7 +519,7 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         bottom.addWidget(QLabel("微信推送Key(Server酱，可选):"))
         self.key_input = QLineEdit()
-        self.key_input.setPlaceholderText("SCT... 填写后风险触发时自动推送微信")
+        self.key_input.setPlaceholderText("SCT...（预留：推送功能待实现）")
         self.key_input.setText(self.config.get("server_key", ""))
         self.key_input.setFixedWidth(260)
         self.key_input.textChanged.connect(self._save_server_key)
@@ -468,6 +554,8 @@ class MainWindow(QMainWindow):
     def _tray_show(self):
         self.showNormal()
         self.activateWindow()
+        # 恢复窗口时立即刷新一次（暂停期间数据可能已过期）
+        self._refresh()
 
     def _tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -475,7 +563,6 @@ class MainWindow(QMainWindow):
 
     def changeEvent(self, event):
         super().changeEvent(event)
-        from PyQt6.QtCore import QEvent
         if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
             self.hide()
 
@@ -598,8 +685,8 @@ class MainWindow(QMainWindow):
         # 取出源行数据
         items = [self.table.takeItem(src, c) for c in range(8)]
         self.table.removeRow(src)
-        # dst 因删除后可能偏移
-        insert_at = dst if dst < src else dst
+        # 往下拖时，删除源行会使目标行上移一位，插入点需 -1；往上拖不受影响
+        insert_at = dst if dst < src else dst - 1
         self.table.insertRow(insert_at)
         for c, item in enumerate(items):
             self.table.setItem(insert_at, c, item)
@@ -663,8 +750,15 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_timer"):
             self._timer.stop()
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._refresh)
+        self._timer.timeout.connect(self._auto_refresh)
         self._timer.start(self.config.get("interval", 10) * 1000)
+
+    def _auto_refresh(self):
+        """定时器触发的刷新：主窗口和浮窗都不可见时跳过，省流量/省接口调用"""
+        if not self.isVisible() and not self._float_win.isVisible():
+            self.status_label.setText("已暂停（窗口/浮窗均未显示）")
+            return
+        self._refresh()
 
     def _refresh(self):
         if self.worker and self.worker.isRunning():
@@ -789,7 +883,7 @@ class MainWindow(QMainWindow):
 
             # 同步浮窗
             if self._float_win.has_stock(code):
-                self._float_win.update_stock(code, price, change_pct, trend_text)
+                self._float_win.update_stock(code, price, change_pct)
             break
 
     def _table_context_menu(self, pos):
@@ -831,7 +925,10 @@ class MainWindow(QMainWindow):
             if self.table.item(r, 0).text() == code:
                 item = QTableWidgetItem(f"获取失败: {msg}")
                 item.setForeground(QColor("#999999"))
-                self.table.setItem(r, 6, item)
+                item.setToolTip(msg)
+                self.table.setItem(r, 1, item)   # 写入“名称”列（文本列），不覆盖数据列
+                for c in range(2, 8):            # 其余数据列清空，避免残留旧值被误认为最新
+                    self.table.setItem(r, c, QTableWidgetItem("--"))
                 break
 
     def _push_weixin(self, code, name, price, change_pct, risks, ma_status=""):

@@ -21,7 +21,7 @@ dist\stock_monitor.exe
 | 功能 | 说明 |
 |---|---|
 | 添加/删除股票 | 支持A股、ETF、期指、港股、恒生指数等任意代码 |
-| 实时价格 | 精确到小数点后3位（东方财富接口原生精度） |
+| 实时价格 | 显示到小数点后4位（腾讯前复权K线收盘价） |
 | 涨跌幅 | 红涨绿跌（A股惯例） |
 | 趋势（算法4） | 综合均线位置、MA20斜率、价格结构，输出5档强弱判断，鼠标悬停列头显示规则 |
 | 均线状态 | 股价与MA5/10/20/30的位置关系，全上方/全下方/混合，自动标色 |
@@ -118,7 +118,10 @@ N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保
 ```
 stock_monitor.py
 ├── search_secid(code)         # 东方财富搜索接口：code → (secid, name)，内存缓存
-├── fetch_stock_data(code)     # 东方财富K线接口：拉80日历史，返回价格/涨跌幅/MA5-60/成交量/收盘价列表
+├── fetch_stock_data(code)     # 组合K线源+实时价：拉80日历史，返回价格/涨跌幅/MA5-60/成交量/收盘价列表
+│   ├── _fetch_kline_tencent(tc)     # 腾讯K线(主，风控松)：A股/ETF/港股/恒指
+│   └── _fetch_kline_eastmoney(secid)# 东财K线(兜底，全品种)：A50期指等腾讯不支持的品种
+├── fetch_realtime_quote(tc)   # 腾讯实时行情：盘中高精度当天价/涨跌幅，取不到返回None降级
 ├── FloatWidget                # 置顶浮窗，支持任意数量股票，每行：价格  涨跌幅
 │   ├── _rebuild_rows()        # 增删股票时重建所有行（Label 透传鼠标事件，整体可拖）
 │   ├── _apply_data()          # 更新某行数据（涨跌幅颜色跟随字体颜色设置）
@@ -143,9 +146,12 @@ stock_monitor.py
 | 用途 | 接口 | 备注 |
 |---|---|---|
 | 代码搜索/secid | `searchapi.eastmoney.com/api/suggest/get` | 东方财富，支持任意代码格式 |
-| 历史K线/均线/成交量 | `push2his.eastmoney.com/api/qt/stock/kline/get` | 东方财富，前复权日K，3位小数精度 |
+| 历史K线（主） | `web.ifzq.gtimg.cn/appstock/app/fqkline/get` | 腾讯，前复权日K，拉 80 日，风控松 |
+| 历史K线（兜底） | `push2his.eastmoney.com/api/qt/stock/kline/get` | 东方财富，secid 直查，覆盖 A50 期指等腾讯不支持的品种 |
+| 实时行情（盘中高精度价） | `qt.gtimg.cn/q={前缀+代码}` | 腾讯，盘中拿 3 位精度当天价/涨跌幅 |
 
-> K线字段（逗号分隔）：`日期,开,收,高,低,成交量,...`，收盘价索引2，成交量索引5。
+> K线优先腾讯（风控松，覆盖 A股/ETF/港股/恒指），腾讯取不到才降级东方财富——东财 `push2his` 高频请求易被限流，只留给 A50 期指等特殊品种。
+> 盘中当天最新价优先用腾讯实时接口（K线当天那根盘中只有 2 位精度）；期指等不覆盖的品种降级用 K线收盘价。
 
 ---
 
