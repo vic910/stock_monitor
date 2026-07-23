@@ -23,7 +23,8 @@
   - 趋势(算法4): 均线位置(40%) + MA20斜率(30%) + 价格结构(30%) 加权评分，5档强弱
   - 均线状态   : 股价与 MA5/10/20/30 的上下方位置关系
   - 活跃度(N/M): N日均量 / M日均量，N、M 可在界面设置
-  - 做T策略    : 股价 ≥ MA10 → 积极买进，< MA10 → 积极卖出
+  - 趋势做T策略 : 股价 ≥ MA10 → 积极买进，< MA10 → 积极卖出（自动）
+  - 我的做T策略 : 下拉框手动选择（3档策略，带字体色），按股票持久化到 config.t_strategy
 
 扩展方向：
   - 微信/风险推送: 实现风险判断 → _last_push 限流 → _push_weixin（建议放子线程）
@@ -42,7 +43,8 @@ import urllib.parse
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
-    QHeaderView, QMessageBox, QSpinBox, QMenu, QSystemTrayIcon, QColorDialog
+    QHeaderView, QMessageBox, QSpinBox, QMenu, QSystemTrayIcon, QColorDialog,
+    QComboBox
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint, QEvent
 from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap, QPainter, QPen
@@ -69,6 +71,14 @@ def save_config(config):
 
 # 进程级缓存，避免每次刷新都重复搜索 secid
 _secid_cache = {}   # code → (secid, name)
+
+# “我的做T策略”下拉选项：(显示文本, 字体颜色)，索引即持久化到 config 的值
+T_STRATEGY_OPTIONS = [
+    ("", "#000000"),                              # 0 空（默认）
+    ("开盘或回踩买进（强势）", "#e74c3c"),        # 1 红
+    ("拉高卖出下跌买入（震荡分歧）", "#000000"),   # 2 黑
+    ("开盘或拉高卖出（弱势）", "#27ae60"),        # 3 绿
+]
 
 
 def search_secid(code):
@@ -492,17 +502,18 @@ class MainWindow(QMainWindow):
         top.addWidget(self.refresh_btn)
         layout.addLayout(top)
 
-        # 数据表格，列：代码/名称/最新价/涨跌幅/趋势/均线状态/活跃度
+        # 数据表格，列：代码/名称/最新价/涨跌幅/均线状态/趋势/活跃度/趋势做T策略/我的做T策略/排序
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "均线状态", "趋势", "活跃度(N/M)", "做T策略", "排序"])
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "均线状态", "趋势", "活跃度(N/M)", "趋势做T策略", "我的做T策略", "排序"])
         h = self.table.horizontalHeader()
-        for i in range(9):
+        for i in range(10):
             h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         tooltips = {
             5: "趋势（算法4）：综合均线位置(40%)、MA20斜率(30%)、价格结构(30%)加权评分\n强势↑ ≥0.85 | 偏多↗ 0.60~0.85 | 震荡→ 0.40~0.60 | 偏空↘ 0.15~0.40 | 弱势↓ <0.15",
             6: "活跃度 = N日均量 / M日均量\n≥2.0x 明显放量(红) | 1.2~2.0x 轻微放量(橙) | 1.0~1.2x 正常(灰) | <1.0x 缩量(绿)",
-            7: "做T策略：股价 ≥ MA10 → 积极买进(红)\n股价 < MA10 → 积极卖出(绿)",
+            7: "趋势做T策略（自动）：股价 ≥ MA10 → 积极买进(红)\n股价 < MA10 → 积极卖出(绿)",
+            8: "我的做T策略：手动下拉选择\n开盘回踩买进(强势,红) | 拉高卖出下跌买入(震荡分歧,黑) | 开盘拉高卖出(弱势,绿)",
         }
         for col, tip in tooltips.items():
             item = self.table.horizontalHeaderItem(col)
@@ -572,9 +583,47 @@ class MainWindow(QMainWindow):
     def _insert_row(self, code):
         r = self.table.rowCount()
         self.table.insertRow(r)
+        # 文本列 0~7（代码+6个数据列+趋势做T策略），第8列下拉框，第9列排序按钮
         for c, text in enumerate([code, "--", "--", "--", "--", "--", "--", "--"]):
             self.table.setItem(r, c, QTableWidgetItem(text))
+        self._set_t_strategy_combo(r, code)
         self._set_sort_buttons(r)
+
+    def _set_t_strategy_combo(self, row, code):
+        """第8列“我的做T策略”下拉框，选项文本带对应字体色，选择后按股票代码持久化"""
+        combo = QComboBox()
+        for text, _color in T_STRATEGY_OPTIONS:
+            combo.addItem(text)
+        saved = self.config.get("t_strategy", {}).get(code, 0)
+        if 0 <= saved < len(T_STRATEGY_OPTIONS):
+            combo.setCurrentIndex(saved)
+        self._apply_combo_color(combo, combo.currentIndex())
+        combo.currentIndexChanged.connect(
+            lambda idx, c=combo: self._on_t_strategy_changed(c, idx)
+        )
+        self.table.setCellWidget(row, 8, combo)
+
+    def _apply_combo_color(self, combo, idx):
+        """把下拉框当前选项的字体色应用到显示"""
+        if 0 <= idx < len(T_STRATEGY_OPTIONS):
+            color = T_STRATEGY_OPTIONS[idx][1]
+            combo.setStyleSheet(f"QComboBox {{ color: {color}; }}")
+
+    def _on_t_strategy_changed(self, combo, idx):
+        self._apply_combo_color(combo, idx)
+        # 定位该下拉框所在行的股票代码并持久化
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, 8) is combo:
+                code = self.table.item(r, 0).text()
+                self.config.setdefault("t_strategy", {})[code] = idx
+                save_config(self.config)
+                break
+
+    def _forget_t_strategy(self, code):
+        """删除股票时清理其“我的做T策略”持久化，避免残留"""
+        t_map = self.config.get("t_strategy")
+        if t_map and code in t_map:
+            del t_map[code]
 
     def _set_sort_buttons(self, row):
         w = QWidget()
@@ -659,11 +708,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(btn_up)
         lay.addWidget(btn_dn)
         lay.addWidget(btn_drag)
-        self.table.setCellWidget(row, 8, w)
+        self.table.setCellWidget(row, 9, w)
 
     def _widget_row(self, widget):
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 8) == widget:
+            if self.table.cellWidget(r, 9) == widget:
                 return r
         return -1
 
@@ -671,25 +720,40 @@ class MainWindow(QMainWindow):
         target = row + direction
         if target < 0 or target >= self.table.rowCount():
             return
+        # 交换文本列（0~7）
         for c in range(8):
             a = self.table.takeItem(row, c)
             b = self.table.takeItem(target, c)
             self.table.setItem(row, c, b)
             self.table.setItem(target, c, a)
+        # 交换“我的做T策略”下拉框的选择（第8列是 cellWidget，不能 takeItem）
+        cb_a = self.table.cellWidget(row, 8)
+        cb_b = self.table.cellWidget(target, 8)
+        if cb_a is not None and cb_b is not None:
+            ia, ib = cb_a.currentIndex(), cb_b.currentIndex()
+            cb_a.setCurrentIndex(ib)
+            cb_b.setCurrentIndex(ia)
         self.table.setCurrentCell(target, 0)
         self._save_stocks()
 
     def _drag_move_row(self, src, dst):
         if src == dst:
             return
-        # 取出源行数据
+        # 取出源行文本列（0~7）和“我的做T策略”下拉框的选择值
         items = [self.table.takeItem(src, c) for c in range(8)]
+        cb = self.table.cellWidget(src, 8)
+        t_idx = cb.currentIndex() if cb is not None else 0
+        code = items[0].text() if items[0] else ""
         self.table.removeRow(src)
         # 往下拖时，删除源行会使目标行上移一位，插入点需 -1；往上拖不受影响
         insert_at = dst if dst < src else dst - 1
         self.table.insertRow(insert_at)
         for c, item in enumerate(items):
             self.table.setItem(insert_at, c, item)
+        self._set_t_strategy_combo(insert_at, code)
+        new_cb = self.table.cellWidget(insert_at, 8)
+        if new_cb is not None:
+            new_cb.setCurrentIndex(t_idx)
         self._set_sort_buttons(insert_at)
         self.table.setCurrentCell(insert_at, 0)
         self._save_stocks()
@@ -712,6 +776,7 @@ class MainWindow(QMainWindow):
         for r in rows:
             code = self.table.item(r, 0).text()
             self._float_win.remove_stock(code)
+            self._forget_t_strategy(code)
             self.table.removeRow(r)
         if not self._float_win._codes:
             self._float_win.hide()
@@ -917,6 +982,7 @@ class MainWindow(QMainWindow):
             self._float_win.remove_stock(code)
             if not self._float_win._codes:
                 self._float_win.hide()
+            self._forget_t_strategy(code)
             self.table.removeRow(row)
             self._save_stocks()
 
@@ -927,7 +993,7 @@ class MainWindow(QMainWindow):
                 item.setForeground(QColor("#999999"))
                 item.setToolTip(msg)
                 self.table.setItem(r, 1, item)   # 写入“名称”列（文本列），不覆盖数据列
-                for c in range(2, 8):            # 其余数据列清空，避免残留旧值被误认为最新
+                for c in range(2, 8):            # 数据列(2~7)清空；第8列是用户手动策略，不动
                     self.table.setItem(r, c, QTableWidgetItem("--"))
                 break
 
