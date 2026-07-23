@@ -205,6 +205,85 @@ def _fetch_kline_eastmoney(secid):
     return closes, volumes, data.get("name")
 
 
+# 板块总成交额统计用的三只指数腾讯前缀：上证指数 + 深证成指 + 创业板指
+_MARKET_INDEX_TC = ["sh000001", "sz399001", "sz399006"]
+
+
+def _fetch_index_amount_series(tc, lmt=70):
+    """腾讯 newfqkline 接口拉单只指数近 lmt 天成交额，返回 {日期: 成交额(元)}。失败返回 {}。
+    该接口带成交额字段（索引8，单位万元），且腾讯不限流。
+    K线格式: [日期, 开, 收, 高, 低, 成交量, {}, 涨跌幅, 成交额(万元), ...]
+    """
+    try:
+        url = (
+            f"https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get"
+            f"?_var=k&param={tc},day,,,{lmt},qfq"
+        )
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://gu.qq.com/",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+        data = json.loads(raw[raw.index("=") + 1:])
+        sd = (data.get("data") or {}).get(tc, {})
+        klines = sd.get("qfqday") or sd.get("day") or []
+        out = {}
+        for k in klines:
+            try:
+                out[k[0]] = float(k[8]) * 1e4   # 万元 → 元
+            except (IndexError, ValueError, TypeError):
+                pass
+        return out
+    except Exception:
+        return {}
+
+
+def fetch_market_amounts(lmt=70):
+    """腾讯 newfqkline 拉三只指数近 lmt 天成交额，按日期对齐相加，
+    返回 [(日期, 总成交额元), ...] 升序。只保留三只都有数据的交易日。
+    腾讯接口不限流，一次即含完整历史+当日，任一只失败返回 []。
+    """
+    series = [_fetch_index_amount_series(tc, lmt) for tc in _MARKET_INDEX_TC]
+    if any(not s for s in series):
+        return []
+    common_dates = set(series[0])
+    for s in series[1:]:
+        common_dates &= set(s)
+    return [(d, sum(s[d] for s in series)) for d in sorted(common_dates)]
+
+
+def _fetch_index_amount_today(tc):
+    """腾讯实时接口取单只指数当日成交额（元）。字段37单位万元。失败返回 None。"""
+    try:
+        url = f"https://qt.gtimg.cn/q={tc}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://gu.qq.com/",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("gbk", errors="ignore")
+        if '="' not in raw:
+            return None
+        f = raw.split('="', 1)[1].rsplit('";', 1)[0].split("~")
+        if len(f) <= 37 or not f[37]:
+            return None
+        return float(f[37]) * 1e4   # 万元 → 元
+    except Exception:
+        return None
+
+
+def fetch_market_amount_today():
+    """腾讯实时取三只指数当日成交额之和 (日期, 总额元)。任一失败返回 None。"""
+    total = 0.0
+    for tc in _MARKET_INDEX_TC:
+        a = _fetch_index_amount_today(tc)
+        if a is None:
+            return None
+        total += a
+    return time.strftime("%Y-%m-%d"), total
+
+
 def fetch_stock_data(code):
     """拉取单只股票数据，返回 (name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes)
 
@@ -243,6 +322,101 @@ def fetch_stock_data(code):
         return sum(closes[-n:]) / min(n, len(closes))
 
     return name, current, change_pct, ma(5), ma(10), ma(20), ma(30), ma(60), volumes, closes
+
+
+class AmountChartWidget(QWidget):
+    """两市+创业板总成交额可视化（QPainter 手绘）：
+    左侧最近 5 日柱状图（柱顶标数值、柱下标日期），右侧 5/10/20/30/60 日均值文字。
+    数据由 set_data([(日期, 总成交额元), ...] 升序) 传入，单位显示为“亿”。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._data = []          # [(date, amount_yuan), ...] 升序
+        self.setMinimumHeight(120)
+        self.setToolTip("上证指数 + 深证成指 + 创业板指 每日成交额之和\n左：最近5日柱状图  右：5/10/20/30/60日均值")
+
+    def set_data(self, series):
+        self._data = series or []
+        self.update()
+
+    def _avg(self, n):
+        """最近 n 日总成交额均值（元），数据不足则按现有天数"""
+        if not self._data:
+            return 0.0
+        vals = [a for _, a in self._data[-n:]]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    @staticmethod
+    def _fmt_yi(amount_yuan):
+        """元 → “xxxx亿”"""
+        return f"{amount_yuan / 1e8:.0f}亿"
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # 背景
+        painter.fillRect(0, 0, w, h, QColor("#fafafa"))
+
+        if not self._data:
+            painter.setPen(QColor("#999999"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "成交额数据加载中…")
+            painter.end()
+            return
+
+        # 标题
+        title_font = QFont(); title_font.setPointSize(9); title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor("#333333"))
+        painter.drawText(8, 16, "两市+创业板 总成交额")
+
+        # ── 左侧：最近 5 日柱状图 ──────────────────────
+        recent = self._data[-5:]
+        chart_left, chart_top = 12, 26
+        chart_w = int(w * 0.52)
+        chart_bottom = h - 20
+        chart_h = chart_bottom - chart_top
+        if recent and chart_h > 10:
+            max_amt = max(a for _, a in recent) or 1.0
+            n = len(recent)
+            slot = chart_w / n
+            bar_w = min(slot * 0.6, 48)
+            small_font = QFont(); small_font.setPointSize(7)
+            for i, (date, amt) in enumerate(recent):
+                bar_h = int(chart_h * (amt / max_amt))
+                x = int(chart_left + slot * i + (slot - bar_w) / 2)
+                y = chart_bottom - bar_h
+                painter.fillRect(x, y, int(bar_w), bar_h, QColor("#e74c3c"))
+                # 柱顶数值
+                painter.setFont(small_font)
+                painter.setPen(QColor("#333333"))
+                painter.drawText(x - 6, y - 3, int(bar_w) + 12, 12,
+                                 Qt.AlignmentFlag.AlignHCenter, self._fmt_yi(amt))
+                # 柱下日期（MM-DD）
+                painter.setPen(QColor("#888888"))
+                md = date[5:] if len(date) >= 10 else date
+                painter.drawText(x - 6, chart_bottom + 2, int(bar_w) + 12, 14,
+                                 Qt.AlignmentFlag.AlignHCenter, md)
+
+        # ── 右侧：均值文字 ──────────────────────────────
+        avg_left = int(w * 0.58)
+        label_font = QFont(); label_font.setPointSize(9)
+        painter.setFont(label_font)
+        rows = [("5日均量", 5), ("10日均量", 10), ("20日均量", 20),
+                ("30日均量", 30), ("60日均量", 60)]
+        row_h = 18
+        y0 = 30
+        for i, (label, n) in enumerate(rows):
+            y = y0 + i * row_h
+            painter.setPen(QColor("#666666"))
+            painter.drawText(avg_left, y, y0 + 200, 16,
+                             Qt.AlignmentFlag.AlignLeft, f"{label}:")
+            painter.setPen(QColor("#c0392b"))
+            painter.drawText(avg_left + 70, y, 120, 16,
+                             Qt.AlignmentFlag.AlignLeft, self._fmt_yi(self._avg(n)))
+        painter.end()
 
 
 class FloatWidget(QWidget):
@@ -430,6 +604,37 @@ class FetchWorker(QThread):
                 self.error.emit(code, str(e))
 
 
+class IndexHistoryWorker(QThread):
+    """后台线程，拉三只指数完整历史成交额序列（腾讯 newfqkline），启动时用一次。
+    result signal: series_json ([[日期, 总成交额元], ...] 的 JSON)
+    """
+    result = pyqtSignal(str)
+
+    def run(self):
+        try:
+            series = fetch_market_amounts()
+        except Exception:
+            series = []
+        self.result.emit(json.dumps(series))
+
+
+class IndexTodayWorker(QThread):
+    """后台线程，只拉当日总成交额（腾讯实时接口，秒回），跟随刷新间隔用。
+    result signal: (日期, 总成交额元)；失败发 ("", -1)
+    """
+    result = pyqtSignal(str, float)
+
+    def run(self):
+        try:
+            r = fetch_market_amount_today()
+        except Exception:
+            r = None
+        if r is None:
+            self.result.emit("", -1.0)
+        else:
+            self.result.emit(r[0], r[1])
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -437,14 +642,17 @@ class MainWindow(QMainWindow):
         self.resize(960, 520)
         self.config = load_config()
         self.worker = None
+        self._hist_worker = None       # 历史成交额（启动拉一次）
+        self._today_worker = None      # 当日成交额（跟随刷新间隔）
+        self._amount_series = []       # 内存中的总成交额序列 [(日期, 元), ...] 升序
         self._float_win = FloatWidget(bg_color=self.config.get("float_bg", "#2c3e50"), font_color=self.config.get("float_font_color", "#ffffff"))
         self._float_win.color_changed.connect(self._on_float_color_changed)
         self._float_win.font_color_changed.connect(self._on_float_font_color_changed)
         self._build_ui()
         self._build_tray()
         self._start_timer()
-        if self.config.get("stocks"):
-            self._refresh()
+        self._refresh()                  # 首次加载股票数据
+        self._load_amount_history()      # 启动拉一次 60 日历史成交额
 
     def _build_ui(self):
         central = QWidget()
@@ -525,6 +733,10 @@ class MainWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_context_menu)
         layout.addWidget(self.table)
+
+        # 成交额图表（两市+创业板总成交额）
+        self.amount_chart = AmountChartWidget()
+        layout.addWidget(self.amount_chart)
 
         # 底部：微信推送Key + 状态栏
         bottom = QHBoxLayout()
@@ -826,6 +1038,8 @@ class MainWindow(QMainWindow):
         self._refresh()
 
     def _refresh(self):
+        # 当日成交额跟随刷新间隔更新图表最新一根（历史在启动时已拉，不重复请求）
+        self._refresh_amount_today()
         if self.worker and self.worker.isRunning():
             return
         codes = [self.table.item(r, 0).text() for r in range(self.table.rowCount())]
@@ -838,6 +1052,41 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self._on_error)
         self.worker.finished.connect(self._on_fetch_done)
         self.worker.start()
+
+    def _load_amount_history(self):
+        """启动时拉一次完整历史成交额（幂等）"""
+        if self._hist_worker and self._hist_worker.isRunning():
+            return
+        self._hist_worker = IndexHistoryWorker()
+        self._hist_worker.result.connect(self._on_amount_history)
+        self._hist_worker.start()
+
+    def _on_amount_history(self, series_json):
+        try:
+            series = json.loads(series_json)
+        except (ValueError, TypeError):
+            series = []
+        if not series:
+            return   # 历史拉取失败，保留现状（当日刷新仍会兜底追加）
+        self._amount_series = [(d, a) for d, a in series]
+        self.amount_chart.set_data(self._amount_series)
+
+    def _refresh_amount_today(self):
+        """跟随刷新间隔拉当日总成交额，更新内存序列最新一根（幂等）"""
+        if self._today_worker and self._today_worker.isRunning():
+            return
+        self._today_worker = IndexTodayWorker()
+        self._today_worker.result.connect(self._on_amount_today)
+        self._today_worker.start()
+
+    def _on_amount_today(self, date, total):
+        if not date or total < 0:
+            return   # 当日拉取失败
+        if self._amount_series and self._amount_series[-1][0] == date:
+            self._amount_series[-1] = (date, total)   # 覆盖当日
+        else:
+            self._amount_series.append((date, total)) # 新交易日追加
+        self.amount_chart.set_data(self._amount_series)
 
     def _on_fetch_done(self):
         self.refresh_btn.setEnabled(True)
