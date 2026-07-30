@@ -20,6 +20,7 @@
   - 微信推送: https://sctapi.ftqq.com/{key}.send  (Server酱，_push_weixin 已封装但当前未接入)
 
 表格各列的计算规则（在 MainWindow._on_result 里）：
+  - 量比       : 腾讯实时接口 f[38]，>2 红/1~2 灰/<1 绿；盘后/期指取不到显示 --
   - 趋势(算法4): 均线位置(40%) + MA20斜率(30%) + 价格结构(30%) 加权评分，5档强弱
   - 均线状态   : 股价与 MA5/10/20/30 的上下方位置关系
   - 活跃度(N/M): N日均量 / M日均量，N、M 可在界面设置
@@ -72,7 +73,7 @@ def save_config(config):
 # 进程级缓存，避免每次刷新都重复搜索 secid
 _secid_cache = {}   # code → (secid, name)
 
-# “我的做T策略”下拉选项：(显示文本, 字体颜色)，索引即持久化到 config 的值
+# "我的做T策略"下拉选项：(显示文本, 字体颜色)，索引即持久化到 config 的值
 T_STRATEGY_OPTIONS = [
     ("", "#000000"),                              # 0 空（默认）
     ("开盘或回踩买进（强势）", "#e74c3c"),        # 1 红
@@ -118,11 +119,11 @@ def _get_tencent_prefix(secid):
 
 
 def fetch_realtime_quote(tc):
-    """腾讯实时行情接口：tc(如 sz159995) → (price, change_pct)，取不到返回 None
+    """腾讯实时行情接口：tc(如 sz159995) → (price, change_pct, vol_ratio)，取不到返回 None
 
     盘中 K线接口当天那根收盘价只有 2 位精度（如 1.26），实时接口给 3 位（1.265），
     且涨跌幅用真实昨收计算。期指等特殊品种此接口不覆盖，返回 None 由调用方降级。
-    字段(~分隔): 索引3=当前价, 索引4=昨收, 索引32=涨跌幅
+    字段(~分隔): 索引3=当前价, 索引32=涨跌幅, 索引38=换手率, 索引49=量比
     """
     try:
         url = f"https://qt.gtimg.cn/q={tc}"
@@ -140,7 +141,8 @@ def fetch_realtime_quote(tc):
             return None
         price = float(f[3])
         change_pct = float(f[32]) if f[32] else 0.0
-        return price, change_pct
+        vol_ratio = float(f[49]) if len(f) > 49 and f[49] else None
+        return price, change_pct, vol_ratio
     except Exception:
         return None
 
@@ -285,13 +287,14 @@ def fetch_market_amount_today():
 
 
 def fetch_stock_data(code):
-    """拉取单只股票数据，返回 (name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes)
+    """拉取单只股票数据，返回 (name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes, vol_ratio)
 
     K线来源：优先腾讯（风控松，覆盖 A股/ETF/港股/恒指），腾讯取不到再降级东方财富
     （secid 直查，覆盖 A50 等境外期指）。避免东财 push2his 高频请求触发限流。
 
     价格精度：均线/趋势/成交量全部基于 K线收盘价计算；当天最新价和涨跌幅优先取
     腾讯实时行情接口（高精度），取不到时降级用 K线收盘价（期指等特殊品种走此分支）。
+    vol_ratio：量比，从腾讯实时接口 f[38] 取，取不到为 None。
     """
     secid, name = search_secid(code)
     tc = _get_tencent_prefix(secid)
@@ -313,21 +316,22 @@ def fetch_stock_data(code):
 
     # 用腾讯实时行情覆盖当天最新价/涨跌幅（高精度），并同步 closes[-1] 使均线口径一致；
     # 取不到（如期指，腾讯实时接口不覆盖）则保持 K线收盘价不变
+    vol_ratio = None
     rt = fetch_realtime_quote(tc)
     if rt is not None:
-        current, change_pct = rt
+        current, change_pct, vol_ratio = rt
         closes[-1] = current
 
     def ma(n):
         return sum(closes[-n:]) / min(n, len(closes))
 
-    return name, current, change_pct, ma(5), ma(10), ma(20), ma(30), ma(60), volumes, closes
+    return name, current, change_pct, ma(5), ma(10), ma(20), ma(30), ma(60), volumes, closes, vol_ratio
 
 
 class AmountChartWidget(QWidget):
     """两市+创业板总成交额可视化（QPainter 手绘）：
     左侧最近 5 日柱状图（柱顶标数值、柱下标日期），右侧 5/10/20/30/60 日均值文字。
-    数据由 set_data([(日期, 总成交额元), ...] 升序) 传入，单位显示为“亿”。
+    数据由 set_data([(日期, 总成交额元), ...] 升序) 传入，单位显示为"亿"。
     """
 
     def __init__(self):
@@ -349,7 +353,7 @@ class AmountChartWidget(QWidget):
 
     @staticmethod
     def _fmt_yi(amount_yuan):
-        """元 → “xxxx亿”"""
+        """元 → 'xxxx亿'"""
         return f"{amount_yuan / 1e8:.0f}亿"
 
     def paintEvent(self, event):
@@ -500,29 +504,33 @@ class FloatWidget(QWidget):
             chg_lbl.setFont(self._make_font(9))
             chg_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             chg_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            vol_lbl = QLabel("--")
+            vol_lbl.setFont(self._make_font(9))
+            vol_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            vol_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             row.addWidget(price_lbl)
             row.addWidget(chg_lbl)
+            row.addWidget(vol_lbl)
             self._main_layout.addLayout(row)
-            self._rows[code] = (price_lbl, chg_lbl)
+            self._rows[code] = (price_lbl, chg_lbl, vol_lbl)
             if code in self._data:
                 self._apply_data(code, *self._data[code])
 
         self.adjustSize()
 
-    def _apply_data(self, code, price, change_pct):
-        """把数据写入对应行的 Label（价格 + 涨跌幅）"""
+    def _apply_data(self, code, price, change_pct, vol_ratio=None):
+        """把数据写入对应行的 Label（价格 + 涨跌幅 + 量比）"""
         if code not in self._rows:
             return
-        price_lbl, chg_lbl = self._rows[code]
+        price_lbl, chg_lbl, vol_lbl = self._rows[code]
         price_lbl.setText(f"{price:.4f}")
         fc = self._font_color
-        if change_pct > 0:
-            chg_lbl.setText(f"{change_pct:+.2f}%")
-        elif change_pct < 0:
-            chg_lbl.setText(f"{change_pct:.2f}%")
-        else:
-            chg_lbl.setText(f"{change_pct:.2f}%")
+        chg_lbl.setText(f"{change_pct:+.2f}%")
         chg_lbl.setStyleSheet(f"color: {fc}; background: transparent;")
+        if vol_ratio is not None and vol_ratio >= 0:
+            vol_lbl.setText(f"{vol_ratio:.2f}")
+        else:
+            vol_lbl.setText("--")
 
 
     def add_stock(self, code):
@@ -538,9 +546,9 @@ class FloatWidget(QWidget):
         self._data.pop(code, None)
         self._rebuild_rows()
 
-    def update_stock(self, code, price, change_pct):
-        self._data[code] = (price, change_pct)
-        self._apply_data(code, price, change_pct)
+    def update_stock(self, code, price, change_pct, vol_ratio=None):
+        self._data[code] = (price, change_pct, vol_ratio)
+        self._apply_data(code, price, change_pct, vol_ratio)
         self.adjustSize()
 
     def has_stock(self, code):
@@ -584,10 +592,10 @@ class FloatWidget(QWidget):
 
 class FetchWorker(QThread):
     """后台线程，依次拉取每只股票数据，通过 signal 通知主线程更新 UI
-    result signal: (code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60, vols_json, closes_json)
+    result signal: (code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60, vols_json, closes_json, vol_ratio)
     error  signal: (code, error_msg)
     """
-    result = pyqtSignal(str, str, float, float, float, float, float, float, float, str, str)
+    result = pyqtSignal(str, str, float, float, float, float, float, float, float, str, str, float)
     error = pyqtSignal(str, str)
 
     def __init__(self, codes):
@@ -597,9 +605,10 @@ class FetchWorker(QThread):
     def run(self):
         for code in self.codes:
             try:
-                name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes = fetch_stock_data(code)
+                name, price, change_pct, ma5, ma10, ma20, ma30, ma60, volumes, closes, vol_ratio = fetch_stock_data(code)
                 self.result.emit(code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60,
-                                 json.dumps(volumes), json.dumps(closes))
+                                 json.dumps(volumes), json.dumps(closes),
+                                 vol_ratio if vol_ratio is not None else -1.0)
             except Exception as e:
                 self.error.emit(code, str(e))
 
@@ -710,18 +719,19 @@ class MainWindow(QMainWindow):
         top.addWidget(self.refresh_btn)
         layout.addLayout(top)
 
-        # 数据表格，列：代码/名称/最新价/涨跌幅/均线状态/趋势/活跃度/趋势做T策略/我的做T策略/排序
+        # 数据表格，列：代码/名称/最新价/涨跌幅/量比/均线状态/趋势/活跃度/趋势做T策略/我的做T策略/排序
         self.table = QTableWidget()
-        self.table.setColumnCount(10)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "均线状态", "趋势", "活跃度(N/M)", "趋势做T策略", "我的做T策略", "排序"])
+        self.table.setColumnCount(11)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "量比", "均线状态", "趋势", "活跃度(N/M)", "趋势做T策略", "我的做T策略", "排序"])
         h = self.table.horizontalHeader()
-        for i in range(10):
+        for i in range(11):
             h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         tooltips = {
-            5: "趋势（算法4）：综合均线位置(40%)、MA20斜率(30%)、价格结构(30%)加权评分\n强势↑ ≥0.85 | 偏多↗ 0.60~0.85 | 震荡→ 0.40~0.60 | 偏空↘ 0.15~0.40 | 弱势↓ <0.15",
-            6: "活跃度 = N日均量 / M日均量\n≥2.0x 明显放量(红) | 1.2~2.0x 轻微放量(橙) | 1.0~1.2x 正常(灰) | <1.0x 缩量(绿)",
-            7: "趋势做T策略（自动）：股价 ≥ MA10 → 积极买进(红)\n股价 < MA10 → 积极卖出(绿)",
-            8: "我的做T策略：手动下拉选择\n开盘回踩买进(强势,红) | 拉高卖出下跌买入(震荡分歧,黑) | 开盘拉高卖出(弱势,绿)",
+            4: "量比 = 当日每分钟均量 / 过去5日每分钟均量\n>2 放量(红) | 1~2 正常(灰) | <1 缩量(绿)",
+            6: "趋势（算法4）：综合均线位置(40%)、MA20斜率(30%)、价格结构(30%)加权评分\n强势↑ ≥0.85 | 偏多↗ 0.60~0.85 | 震荡→ 0.40~0.60 | 偏空↘ 0.15~0.40 | 弱势↓ <0.15",
+            7: "活跃度 = N日均量 / M日均量\n≥2.0x 明显放量(红) | 1.2~2.0x 轻微放量(橙) | 1.0~1.2x 正常(灰) | <1.0x 缩量(绿)",
+            8: "趋势做T策略（自动）：股价 ≥ MA10 → 积极买进(红)\n股价 < MA10 → 积极卖出(绿)",
+            9: "我的做T策略：手动下拉选择\n开盘回踩买进(强势,红) | 拉高卖出下跌买入(震荡分歧,黑) | 开盘拉高卖出(弱势,绿)",
         }
         for col, tip in tooltips.items():
             item = self.table.horizontalHeaderItem(col)
@@ -795,14 +805,14 @@ class MainWindow(QMainWindow):
     def _insert_row(self, code):
         r = self.table.rowCount()
         self.table.insertRow(r)
-        # 文本列 0~7（代码+6个数据列+趋势做T策略），第8列下拉框，第9列排序按钮
-        for c, text in enumerate([code, "--", "--", "--", "--", "--", "--", "--"]):
+        # 文本列 0~8（代码+7个数据列+趋势做T策略），第9列下拉框，第10列排序按钮
+        for c, text in enumerate([code, "--", "--", "--", "--", "--", "--", "--", "--"]):
             self.table.setItem(r, c, QTableWidgetItem(text))
         self._set_t_strategy_combo(r, code)
         self._set_sort_buttons(r)
 
     def _set_t_strategy_combo(self, row, code):
-        """第8列“我的做T策略”下拉框，选项文本带对应字体色，选择后按股票代码持久化"""
+        """第9列"我的做T策略"下拉框，选项文本带对应字体色，选择后按股票代码持久化"""
         combo = QComboBox()
         for text, _color in T_STRATEGY_OPTIONS:
             combo.addItem(text)
@@ -813,7 +823,7 @@ class MainWindow(QMainWindow):
         combo.currentIndexChanged.connect(
             lambda idx, c=combo: self._on_t_strategy_changed(c, idx)
         )
-        self.table.setCellWidget(row, 8, combo)
+        self.table.setCellWidget(row, 9, combo)
 
     def _apply_combo_color(self, combo, idx):
         """把下拉框当前选项的字体色应用到显示"""
@@ -825,14 +835,14 @@ class MainWindow(QMainWindow):
         self._apply_combo_color(combo, idx)
         # 定位该下拉框所在行的股票代码并持久化
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 8) is combo:
+            if self.table.cellWidget(r, 9) is combo:
                 code = self.table.item(r, 0).text()
                 self.config.setdefault("t_strategy", {})[code] = idx
                 save_config(self.config)
                 break
 
     def _forget_t_strategy(self, code):
-        """删除股票时清理其“我的做T策略”持久化，避免残留"""
+        """删除股票时清理其"我的做T策略"持久化，避免残留"""
         t_map = self.config.get("t_strategy")
         if t_map and code in t_map:
             del t_map[code]
@@ -920,11 +930,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(btn_up)
         lay.addWidget(btn_dn)
         lay.addWidget(btn_drag)
-        self.table.setCellWidget(row, 9, w)
+        self.table.setCellWidget(row, 10, w)
 
     def _widget_row(self, widget):
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 9) == widget:
+            if self.table.cellWidget(r, 10) == widget:
                 return r
         return -1
 
@@ -932,15 +942,15 @@ class MainWindow(QMainWindow):
         target = row + direction
         if target < 0 or target >= self.table.rowCount():
             return
-        # 交换文本列（0~7）
-        for c in range(8):
+        # 交换文本列（0~8）
+        for c in range(9):
             a = self.table.takeItem(row, c)
             b = self.table.takeItem(target, c)
             self.table.setItem(row, c, b)
             self.table.setItem(target, c, a)
-        # 交换“我的做T策略”下拉框的选择（第8列是 cellWidget，不能 takeItem）
-        cb_a = self.table.cellWidget(row, 8)
-        cb_b = self.table.cellWidget(target, 8)
+        # 交换"我的做T策略"下拉框的选择（第9列是 cellWidget，不能 takeItem）
+        cb_a = self.table.cellWidget(row, 9)
+        cb_b = self.table.cellWidget(target, 9)
         if cb_a is not None and cb_b is not None:
             ia, ib = cb_a.currentIndex(), cb_b.currentIndex()
             cb_a.setCurrentIndex(ib)
@@ -951,9 +961,9 @@ class MainWindow(QMainWindow):
     def _drag_move_row(self, src, dst):
         if src == dst:
             return
-        # 取出源行文本列（0~7）和“我的做T策略”下拉框的选择值
-        items = [self.table.takeItem(src, c) for c in range(8)]
-        cb = self.table.cellWidget(src, 8)
+        # 取出源行文本列（0~8）和"我的做T策略"下拉框的选择值
+        items = [self.table.takeItem(src, c) for c in range(9)]
+        cb = self.table.cellWidget(src, 9)
         t_idx = cb.currentIndex() if cb is not None else 0
         code = items[0].text() if items[0] else ""
         self.table.removeRow(src)
@@ -963,7 +973,7 @@ class MainWindow(QMainWindow):
         for c, item in enumerate(items):
             self.table.setItem(insert_at, c, item)
         self._set_t_strategy_combo(insert_at, code)
-        new_cb = self.table.cellWidget(insert_at, 8)
+        new_cb = self.table.cellWidget(insert_at, 9)
         if new_cb is not None:
             new_cb.setCurrentIndex(t_idx)
         self._set_sort_buttons(insert_at)
@@ -1092,20 +1102,19 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.status_label.setText(f"上次刷新: {time.strftime('%H:%M:%S')}")
 
-    def _on_result(self, code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60, vols_json, closes_json):
+    def _on_result(self, code, name, price, change_pct, ma5, ma10, ma20, ma30, ma60, vols_json, closes_json, vol_ratio_raw):
         for r in range(self.table.rowCount()):
             if self.table.item(r, 0).text() != code:
                 continue
 
             closes = json.loads(closes_json)
             vols   = json.loads(vols_json)
+            vol_ratio_rt = vol_ratio_raw if vol_ratio_raw >= 0 else None  # -1 表示取不到
 
             # ── 算法4：综合趋势强度 ──────────────────────────────
-            # 维度1(40%)：均线得分，股价在几条均线上方
             ma_list = [ma5, ma10, ma20, ma30]
-            ma_score = sum(1 for v in ma_list if price >= v) / 4.0  # 0~1
+            ma_score = sum(1 for v in ma_list if price >= v) / 4.0
 
-            # 维度2(30%)：MA20斜率方向
             if len(closes) >= 25:
                 ma20_now  = sum(closes[-20:]) / 20
                 ma20_prev = sum(closes[-25:-5]) / 20
@@ -1113,11 +1122,9 @@ class MainWindow(QMainWindow):
             else:
                 slope_score = 0.5
 
-            # 维度3(30%)：高低点结构（取最近15根K线的首尾斜率）
             if len(closes) >= 15:
                 seg = closes[-15:]
-                slope_h = seg[-1] - seg[0]
-                structure_score = 1.0 if slope_h > 0 else 0.0
+                structure_score = 1.0 if seg[-1] - seg[0] > 0 else 0.0
             else:
                 structure_score = 0.5
 
@@ -1134,6 +1141,18 @@ class MainWindow(QMainWindow):
             else:
                 trend_text, trend_fg = "弱势↓", QColor("#27ae60")
 
+            # ── 量比（实时接口） ──────────────────────────────────
+            if vol_ratio_rt is not None:
+                vr_text = f"{vol_ratio_rt:.2f}"
+                if vol_ratio_rt >= 2.0:
+                    vr_fg = QColor("#e74c3c")
+                elif vol_ratio_rt >= 1.0:
+                    vr_fg = QColor("#888888")
+                else:
+                    vr_fg = QColor("#27ae60")
+            else:
+                vr_text, vr_fg = "--", None
+
             # ── 活跃度：N日均量 / M日均量 ──────────────────────
             vol_n = self.vol_n_spin.value()
             vol_m = self.vol_m_spin.value()
@@ -1142,20 +1161,20 @@ class MainWindow(QMainWindow):
             avg_n = vol_avg(vol_n)
             avg_m = vol_avg(vol_m)
             if avg_m > 0:
-                vol_ratio = avg_n / avg_m
-                vol_text = f"{vol_ratio:.2f}x"
-                if vol_ratio >= 2.0:
-                    vol_fg = QColor("#e74c3c")
-                elif vol_ratio >= 1.2:
-                    vol_fg = QColor("#e67e22")
-                elif vol_ratio >= 1.0:
-                    vol_fg = QColor("#888888")
+                activity = avg_n / avg_m
+                act_text = f"{activity:.2f}x"
+                if activity >= 2.0:
+                    act_fg = QColor("#e74c3c")
+                elif activity >= 1.2:
+                    act_fg = QColor("#e67e22")
+                elif activity >= 1.0:
+                    act_fg = QColor("#888888")
                 else:
-                    vol_fg = QColor("#27ae60")
+                    act_fg = QColor("#27ae60")
             else:
-                vol_text, vol_fg = "--", None
+                act_text, act_fg = "--", None
 
-            # ── 均线状态：股价在各均线上方/下方 ────────────────
+            # ── 均线状态 ─────────────────────────────────────────
             ma_items = [("MA5", ma5), ("MA10", ma10), ("MA20", ma20), ("MA30", ma30)]
             above = [n for n, v in ma_items if price >= v]
             below = [n for n, v in ma_items if price < v]
@@ -1169,7 +1188,7 @@ class MainWindow(QMainWindow):
             else:
                 ma_status, ma_fg = "--", None
 
-            # ── 做T策略：股价与MA10位置关系 ──────────────────────
+            # ── 做T策略 ───────────────────────────────────────────
             if price >= ma10:
                 t_text, t_fg = "积极买进", QColor("#e74c3c")
             else:
@@ -1182,10 +1201,11 @@ class MainWindow(QMainWindow):
                 1: (name, None),
                 2: (f"{price:.4f}", None),
                 3: (f"{change_pct:+.2f}%", chg_fg),
-                4: (ma_status, ma_fg),
-                5: (trend_text, trend_fg),
-                6: (vol_text, vol_fg),
-                7: (t_text, t_fg),
+                4: (vr_text, vr_fg),
+                5: (ma_status, ma_fg),
+                6: (trend_text, trend_fg),
+                7: (act_text, act_fg),
+                8: (t_text, t_fg),
             }
             for c, (text, fg) in updates.items():
                 item = QTableWidgetItem(text)
@@ -1197,7 +1217,7 @@ class MainWindow(QMainWindow):
 
             # 同步浮窗
             if self._float_win.has_stock(code):
-                self._float_win.update_stock(code, price, change_pct)
+                self._float_win.update_stock(code, price, change_pct, vol_ratio_rt)
             break
 
     def _table_context_menu(self, pos):
@@ -1241,8 +1261,8 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(f"获取失败: {msg}")
                 item.setForeground(QColor("#999999"))
                 item.setToolTip(msg)
-                self.table.setItem(r, 1, item)   # 写入“名称”列（文本列），不覆盖数据列
-                for c in range(2, 8):            # 数据列(2~7)清空；第8列是用户手动策略，不动
+                self.table.setItem(r, 1, item)   # 写入"名称"列（文本列），不覆盖数据列
+                for c in range(2, 9):            # 数据列(2~8)清空；第9列是用户手动策略，不动
                     self.table.setItem(r, c, QTableWidgetItem("--"))
                 break
 
