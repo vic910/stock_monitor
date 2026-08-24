@@ -426,14 +426,44 @@ def fetch_kline_daily(code, start="", end="", count=320):
 
 # 条件类型：type → (归属, 显示模板)。param 为条件参数（日线周期 / 天数）
 COND_TYPES = {
-    "ma_above": ("buy",  "站上{p}日线"),        # 收盘 > MA(param)
-    "cooldown": ("buy",  "距上次卖出>{p}天"),    # 距上次卖出超过 param 个交易日
-    "ma_below": ("sell", "跌破{p}日线"),         # 收盘 < MA(param)
+    "ma_above":    ("buy",  "站上{p}日线"),        # 收盘 > MA(param)
+    "cooldown":    ("buy",  "距上次卖出>{p}天"),    # 距上次卖出超过 param 个交易日
+    "macd_golden": ("buy",  "MACD金叉"),           # DIF 上穿 DEA（12/26/9，param 无意义）
+    "ma_below":    ("sell", "跌破{p}日线"),         # 收盘 < MA(param)
+    "macd_death":  ("sell", "MACD死叉"),           # DIF 下穿 DEA（12/26/9，param 无意义）
 }
 
+# 无参数条件：这些类型的 param 数字框无意义，UI 置灰、回测忽略其值
+PARAMLESS_TYPES = {"macd_golden", "macd_death"}
 
-def _cond_met(cond, closes, i, last_sell_idx):
-    """单个条件在第 i 根K线是否成立。"""
+
+def _macd(closes, fast=12, slow=26, signal=9):
+    """标准 MACD：closes → (dif[], dea[])，与 closes 等长。
+    DIF = EMA(fast) - EMA(slow)，DEA = EMA(DIF, signal)。EMA 以首值播种、递推。
+    前 slow 根尚未稳定，穿越判定由调用方用 i>=slow 过滤。
+    """
+    n = len(closes)
+    if n == 0:
+        return [], []
+
+    def _ema(seq, period):
+        k = 2.0 / (period + 1)
+        out = [seq[0]]
+        for x in seq[1:]:
+            out.append(x * k + out[-1] * (1 - k))
+        return out
+
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    dif = [ema_fast[i] - ema_slow[i] for i in range(n)]
+    dea = _ema(dif, signal)
+    return dif, dea
+
+
+def _cond_met(cond, closes, i, last_sell_idx, macd=None):
+    """单个条件在第 i 根K线是否成立。
+    macd 为 (dif, dea) 预算结果，仅 MACD 类条件需要（由 run_backtest 传入）。
+    """
     t, p = cond["type"], cond["param"]
     if t == "ma_above":
         if i < p - 1:
@@ -447,6 +477,13 @@ def _cond_met(cond, closes, i, last_sell_idx):
         if last_sell_idx is None:
             return True                      # 从未卖出过 → 无冷却限制
         return (i - last_sell_idx) > p
+    if t in ("macd_golden", "macd_death"):
+        if macd is None or i < 26:           # 前 26 根 EMA 未稳定，不判穿越
+            return False
+        dif, dea = macd
+        if t == "macd_golden":               # DIF 上穿 DEA
+            return dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]
+        return dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]   # 下穿
     return False
 
 
@@ -479,6 +516,11 @@ def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
     last_sell_idx = None      # 上次卖出的K线索引（冷却条件用）
     equity_curve = []         # 逐日盯市权益（相对本金的浮动，用于最大回撤）
 
+    # MACD 只在有 MACD 类条件时预算一次（DIF/DEA），避免逐根重算
+    macd = None
+    if any(c["type"] in ("macd_golden", "macd_death") for c in buy_conds + sell_conds):
+        macd = _macd(closes)
+
     n = len(closes)
     for i in range(start_idx, n):
         price = closes[i]
@@ -487,13 +529,13 @@ def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
         equity_curve.append(realized + floating)
 
         if not holding:
-            if buy_conds and all(_cond_met(c, closes, i, last_sell_idx) for c in buy_conds):
+            if buy_conds and all(_cond_met(c, closes, i, last_sell_idx, macd) for c in buy_conds):
                 holding = True
                 buy_price = price
                 trades.append({"date": dates[i], "side": "买入", "price": price,
                                "shares": shares, "pnl": None})
         else:
-            if sell_conds and all(_cond_met(c, closes, i, last_sell_idx) for c in sell_conds):
+            if sell_conds and all(_cond_met(c, closes, i, last_sell_idx, macd) for c in sell_conds):
                 pnl = (price - buy_price) * shares
                 realized += pnl
                 round_trips += 1
@@ -911,9 +953,12 @@ class BacktestWorker(QThread):
 
     def run(self):
         try:
-            # 均线预热：取所有均线类条件里最大周期，多留若干 trading day
+            # 指标预热：取均线周期与 MACD 等效周期(34=EMA26+DEA9)的最大值，多留若干 trading day
             ma_params = [c["param"] for c in self.buy_conds + self.sell_conds
                          if c["type"] in ("ma_above", "ma_below")]
+            if any(c["type"] in ("macd_golden", "macd_death")
+                   for c in self.buy_conds + self.sell_conds):
+                ma_params.append(34)
             pad = (max(ma_params) if ma_params else 5) * 2 + 20
             if self.mode == "range":
                 sd = datetime.datetime.strptime(self.start_date, "%Y-%m-%d") - datetime.timedelta(days=pad * 2)
@@ -1099,11 +1144,18 @@ class _ConditionsCell(QWidget):
         spin.setValue(param if param is not None else (5 if self.kind == "buy" else 10))
         spin.setMinimumWidth(66)
 
+        # 无参数类型（MACD 金叉/死叉）：参数框置灰禁用，值无意义
+        def _sync_spin():
+            ctype = self._types[combo.currentIndex()][0]
+            spin.setEnabled(ctype not in PARAMLESS_TYPES)
+        _sync_spin()
+
         del_btn = QPushButton("－")
         del_btn.setFixedSize(24, 22)
         del_btn.clicked.connect(lambda: self._del_condition(row))
 
         # 类型/参数变更也通过 conditions_changed 通知外层（既重算行高也触发持久化）
+        combo.currentIndexChanged.connect(_sync_spin)
         combo.currentIndexChanged.connect(self.conditions_changed)
         spin.valueChanged.connect(self.conditions_changed)
 

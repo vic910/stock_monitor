@@ -35,14 +35,14 @@
             "end": "2026-08-24",
             "buy": [
                 {
-                    "type": "ma_above",
-                    "param": 10
+                    "type": "macd_golden",
+                    "param": 5
                 }
             ],
             "sell": [
                 {
-                    "type": "ma_below",
-                    "param": 10
+                    "type": "macd_death",
+                    "param": 5
                 }
             ]
         },
@@ -54,7 +54,7 @@
             "end": "2026-08-24",
             "buy": [
                 {
-                    "type": "ma_above",
+                    "type": "macd_golden",
                     "param": 5
                 }
             ],
@@ -73,18 +73,33 @@
             "end": "2026-08-24",
             "buy": [
                 {
-                    "type": "ma_above",
-                    "param": 10
-                },
-                {
-                    "type": "cooldown",
+                    "type": "macd_golden",
                     "param": 5
                 }
             ],
             "sell": [
                 {
                     "type": "ma_below",
+                    "param": 10
+                }
+            ]
+        },
+        {
+            "code": "510300",
+            "mode": "days",
+            "days": 60,
+            "start": "",
+            "end": "",
+            "buy": [
+                {
+                    "type": "ma_above",
                     "param": 5
+                }
+            ],
+            "sell": [
+                {
+                    "type": "ma_below",
+                    "param": 10
                 }
             ]
         }
