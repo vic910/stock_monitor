@@ -41,7 +41,7 @@
             ],
             "sell": [
                 {
-                    "type": "macd_death",
+                    "type": "ma_below",
                     "param": 5
                 }
             ]

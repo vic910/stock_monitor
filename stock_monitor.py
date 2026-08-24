@@ -53,7 +53,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QStackedWidget, QDateEdit, QDialog
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint, QEvent, QDate
-from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap, QPainter, QPen
+from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap, QPainter, QPen, QPolygon, QBrush
 
 # 打包后用 exe 所在目录，开发时用脚本所在目录
 if getattr(sys, 'frozen', False):
@@ -711,6 +711,147 @@ class AmountChartWidget(QWidget):
         painter.end()
 
 
+class KLineChartWidget(QWidget):
+    """回测收盘价折线 + 买卖点标注（QPainter 手绘）。
+    series : [[date, close], ...] 升序（回测区间）
+    trades : [{date, side, price, pnl}, ...]，side ∈ {'买入','卖出'}
+    买点红色 ▲ 标日期；卖点绿色 ▼ 标日期 + 单笔盈亏。
+    """
+
+    RED, GREEN, LINE, AXIS, TEXT = "#e74c3c", "#27ae60", "#2980b9", "#cccccc", "#555555"
+
+    def __init__(self, series, trades):
+        super().__init__()
+        self._series = series or []
+        self._trades = trades or []
+        self.setMinimumSize(680, 400)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.fillRect(0, 0, w, h, QColor("#ffffff"))
+
+        if len(self._series) < 2:
+            painter.setPen(QColor("#999999"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "无足够价格数据")
+            painter.end()
+            return
+
+        dates = [d for d, _ in self._series]
+        closes = [float(c) for _, c in self._series]
+        n = len(closes)
+        pmin, pmax = min(closes), max(closes)
+        span = (pmax - pmin) or 1.0
+        pad = span * 0.08                      # 上下留白，避免曲线贴边
+        pmin, pmax = pmin - pad, pmax + pad
+        span = pmax - pmin
+
+        left, right, top, bottom = 58, 16, 30, 42
+        plot_w = w - left - right
+        plot_h = h - top - bottom
+
+        def px(i):
+            return left + plot_w * (i / (n - 1))
+
+        def py(price):
+            return top + plot_h * (1 - (price - pmin) / span)
+
+        # ── 标题 ──
+        tf = QFont(); tf.setPointSize(9); tf.setBold(True)
+        painter.setFont(tf); painter.setPen(QColor("#333333"))
+        painter.drawText(8, 18, "收盘价与买卖点")
+
+        # ── 网格 + Y 轴价格刻度（5 档）──
+        gf = QFont(); gf.setPointSize(8)
+        painter.setFont(gf)
+        for k in range(5):
+            price = pmin + span * k / 4
+            y = int(py(price))
+            painter.setPen(QPen(QColor(self.AXIS), 1))
+            painter.drawLine(left, y, left + plot_w, y)
+            painter.setPen(QColor(self.TEXT))
+            painter.drawText(0, y - 7, left - 4, 14,
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"{price:.3f}")
+
+        # ── X 轴日期（首/中/尾 3 处）──
+        for i in (0, n // 2, n - 1):
+            x = int(px(i))
+            md = dates[i][5:] if len(dates[i]) >= 10 else dates[i]
+            painter.setPen(QColor(self.TEXT))
+            painter.drawText(x - 28, h - bottom + 6, 56, 14,
+                             Qt.AlignmentFlag.AlignHCenter, md)
+
+        # ── 收盘价折线 ──
+        painter.setPen(QPen(QColor(self.LINE), 1.6))
+        prev = None
+        for i in range(n):
+            cur = QPoint(int(px(i)), int(py(closes[i])))
+            if prev is not None:
+                painter.drawLine(prev, cur)
+            prev = cur
+
+        # ── 买卖点标注 ──
+        idx_of = {d: i for i, d in enumerate(dates)}
+        sf = QFont(); sf.setPointSize(8)
+        for t in self._trades:
+            i = idx_of.get(t["date"])
+            if i is None:
+                continue
+            x, y = int(px(i)), int(py(float(t["price"])))
+            is_buy = t["side"] == "买入"
+            color = QColor(self.RED if is_buy else self.GREEN)
+            painter.setPen(QPen(color, 1))
+            painter.setBrush(QBrush(color))
+            painter.setFont(sf)
+            if is_buy:                          # 点下方向上三角 ▲，下方标日期
+                tip = QPolygon([QPoint(x, y + 6), QPoint(x - 5, y + 15), QPoint(x + 5, y + 15)])
+                painter.drawPolygon(tip)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(color)
+                painter.drawText(x - 30, y + 17, 60, 13,
+                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                                 t["date"][5:])
+            else:                               # 点上方向下三角 ▼，上方标日期 + 单笔盈亏
+                tip = QPolygon([QPoint(x, y - 6), QPoint(x - 5, y - 15), QPoint(x + 5, y - 15)])
+                painter.drawPolygon(tip)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(color)                       # 日期用卖点绿色
+                painter.drawText(x - 30, y - 41, 60, 13,
+                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
+                                 t["date"][5:])
+                pnl = t.get("pnl")
+                if pnl is not None:                          # 盈亏：正红 负绿 零灰
+                    pnl_color = self.RED if pnl > 0 else (self.GREEN if pnl < 0 else "#888888")
+                    painter.setPen(QColor(pnl_color))
+                    painter.drawText(x - 30, y - 28, 60, 13,
+                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
+                                     f"{pnl:+,.0f}")
+
+        # ── 图例 ──
+        painter.setFont(sf)
+        painter.setPen(QColor(self.RED))
+        painter.drawText(left, 18, 90, 14, Qt.AlignmentFlag.AlignLeft, "▲ 买入")
+        painter.setPen(QColor(self.GREEN))
+        painter.drawText(left + 60, 18, 120, 14, Qt.AlignmentFlag.AlignLeft, "▼ 卖出(标盈亏)")
+        painter.end()
+
+
+class KLineDialog(QDialog):
+    """K线买卖点弹窗：内嵌 KLineChartWidget + 关闭按钮。"""
+
+    def __init__(self, code, name, series, trades, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"K线买卖点 · {name}({code})")
+        self.resize(780, 480)
+        lay = QVBoxLayout(self)
+        lay.addWidget(KLineChartWidget(series, trades))
+        btn = QPushButton("关闭")
+        btn.clicked.connect(self.accept)
+        lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+
 class FloatWidget(QWidget):
     """常驻最顶层浮窗，支持任意数量股票，每行：价格  涨跌幅
     内部状态：
@@ -968,6 +1109,8 @@ class BacktestWorker(QThread):
             dates, closes, start_idx = _resolve_backtest_window(series, self.mode, self.days, self.start_date)
             report = run_backtest(dates, closes, self.buy_conds, self.sell_conds, start_idx)
             report["window"] = {"first": dates[start_idx], "last": dates[-1]}
+            # 回测区间的收盘序列，供 K线窗口画折线+标买卖点（不必再联网）
+            report["series"] = [[dates[j], closes[j]] for j in range(start_idx, len(closes))]
             self.result.emit(self.row_id, self.code, name, json.dumps(report))
         except Exception as e:
             self.error.emit(self.row_id, self.code, str(e))
@@ -1276,9 +1419,23 @@ class BacktestResultDialog(QDialog):
         if not trades:
             lay.addWidget(QLabel("该区间内没有触发任何买卖信号。"))
 
-        btn = QPushButton("关闭")
-        btn.clicked.connect(self.accept)
-        lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
+        # ── 底部按钮：查看K线买卖点 + 关闭 ──
+        self._code, self._name = code, name
+        self._series = report.get("series", [])
+        self._trades = trades
+        btn_row = QHBoxLayout()
+        kline_btn = QPushButton("查看K线买卖点")
+        kline_btn.setEnabled(len(self._series) >= 2)   # 无价格数据则不可点
+        kline_btn.clicked.connect(self._show_kline)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(kline_btn)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+    def _show_kline(self):
+        KLineDialog(self._code, self._name, self._series, self._trades, self).exec()
 
 
 class AnalysisWindow(QWidget):
