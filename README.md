@@ -1,6 +1,6 @@
 # 股票监控工具 stock_monitor
 
-A股/ETF/期指/港股实时监控桌面工具。支持多股票监控、综合趋势判断、均线状态、成交活跃度、两市成交额图表、置顶浮窗、系统托盘。
+A股/ETF/期指/港股实时监控桌面工具。支持多股票监控、综合趋势判断、均线状态、成交活跃度、两市成交额图表、策略回测、置顶浮窗、系统托盘。
 
 ---
 
@@ -34,7 +34,8 @@ dist\stock_monitor.exe
 | 排序 | 每行末尾 ↑↓ 按钮点击调整顺序；⠿ 按钮长按拖拽插入任意位置，自动持久化 |
 | 常驻浮窗 | 支持任意数量股票，置顶显示，每行显示价格/涨跌幅/量比，整体可拖动；右键可修改背景色/字体颜色 |
 | 系统托盘 | 最小化后缩至右下角托盘图标，双击恢复，右键退出 |
-| 配置持久化 | 股票列表/刷新间隔/N/M参数/浮窗背景色/浮窗字体颜色/我的做T策略 自动保存 |
+| 股票分析（回测） | 独立窗口，多行策略回测：站上/跌破X日线、上次卖出后冷却N天等多条件（同时满足），输出交易明细+盈亏收益率+统计指标+买入持有对照，10000股基数（见下节） |
+| 配置持久化 | 股票列表/刷新间隔/N/M参数/浮窗背景色/浮窗字体颜色/我的做T策略/股票分析各行 自动保存 |
 
 ---
 
@@ -149,6 +150,39 @@ N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保
 
 ---
 
+## 股票分析（策略回测）
+
+主窗口顶部「股票分析」按钮打开独立窗口，多行表格，每行独立配置一次回测：
+
+| 列 | 内容 |
+|---|---|
+| 股票代码 | 输入框（上）+ 股票名（下，输入完成后台查一次） |
+| 时间类型 | 下拉切换：**最近N天**（5~1000）/ **起止日期**（日历选择） |
+| 买入策略 | 可增删的多条件，「同时满足」才买入 |
+| 卖出策略 | 可增删的多条件，「同时满足」才卖出 |
+| 操作 | 确定（跑回测）/ 删除（删行） |
+
+**条件类型：**
+
+| 归属 | 类型 | 含义 |
+|---|---|---|
+| 买入 | 站上X日线 | 收盘价 > MA(X) |
+| 买入 | 距上次卖出>X天 | 距上次卖出超过 X 个交易日才允许再买（冷却） |
+| 卖出 | 跌破X日线 | 收盘价 < MA(X) |
+
+**回测规则：** 空仓且买入条件全满足 → 买入 10000 股；持仓且卖出条件全满足 → 全部卖出。逐日推进，毛收益（不计手续费）。为让均线在区间起点即有效，会自动向前多拉一段数据预热。
+
+**结果弹窗：**
+
+- **汇总**：区间、买卖策略描述、总盈亏、收益率、本金（首次买入）、期末资产
+- **统计**：交易次数（完整来回）、胜率、最大回撤、期末是否持仓
+- **买入并持有对照**：用首个买点买入并持有到区间末（不执行卖出）的盈亏与收益率，并标注策略相对持有「跑赢/跑输」多少
+- **交易明细表**：每笔买卖的日期、方向、价格、股数、单笔盈亏
+
+> 每行的代码/时间类型/买卖条件在改动后自动保存（防抖），重启后自动还原（`config.analysis_rows`）。
+
+---
+
 ## 代码架构
 
 ```
@@ -160,6 +194,12 @@ stock_monitor.py
 ├── fetch_realtime_quote(tc)   # 腾讯实时行情：盘中高精度当天价/涨跌幅，取不到返回None降级
 ├── fetch_market_amounts()     # 腾讯newfqkline：三只指数60日成交额相加，启动拉一次
 ├── fetch_market_amount_today()# 腾讯实时：三只指数当日成交额之和，跟随刷新间隔
+├── fetch_kline_daily(code,start,end,count)  # 回测用日K：区间/最近N天，返回(name,[(日期,收盘)])升序
+│   ├── _fetch_kline_daily_tencent()   # 腾讯fqkline，前复权，区间按跨度放大count（封顶2000）
+│   └── _fetch_kline_daily_eastmoney() # 东财push2his兜底，beg/end精确区间
+├── run_backtest(...)          # 多条件均线回测引擎：交易明细+汇总+统计+买入持有对照
+│   ├── _cond_met()            # 单条件判定（站上/跌破X日线、冷却N天）
+│   └── _resolve_backtest_window()  # 从序列切出回测窗口起点
 ├── FloatWidget                # 置顶浮窗，支持任意数量股票，每行：价格  涨跌幅
 │   ├── _rebuild_rows()        # 增删股票时重建所有行（Label 透传鼠标事件，整体可拖）
 │   ├── _apply_data()          # 更新某行数据（涨跌幅颜色跟随字体颜色设置）
@@ -169,6 +209,12 @@ stock_monitor.py
 ├── FetchWorker(QThread)       # 后台线程，依次拉股票数据，signal 传给主线程
 ├── IndexHistoryWorker(QThread)# 后台线程，启动拉60日历史成交额
 ├── IndexTodayWorker(QThread)  # 后台线程，跟随刷新间隔拉当日成交额
+├── BacktestWorker(QThread)    # 后台线程：拉日K+跑回测，signal 回主线程（注意勿用start等属性名遮蔽QThread方法）
+├── NameLookupWorker(QThread)  # 后台线程：查股票名回填代码单元格
+├── AnalysisWindow             # 股票分析窗口：多行策略回测，各行配置自动持久化
+│   ├── _add_row()/_del_row()  # 增删行；_save_rows/_schedule_save 防抖落盘 config.analysis_rows
+│   └── _run_row()             # 校验后起 BacktestWorker → BacktestResultDialog 展示
+├── BacktestResultDialog       # 回测结果弹窗：汇总+统计+买入持有对照+交易明细表
 └── MainWindow                 # 主窗口
     ├── _build_tray()          # 系统托盘图标+右键菜单
     ├── changeEvent()          # 最小化 → hide()，浮窗不受影响
@@ -179,7 +225,8 @@ stock_monitor.py
     ├── _refresh_amount_today()# 刷新间隔拉当日成交额 → _on_amount_today 更新末根
     ├── _move_row()            # ↑↓ 按钮回调：交换行内容并保存顺序
     ├── _drag_move_row()       # ⠿ 拖拽按钮回调：删除源行并插入目标位置
-    └── _table_context_menu()  # 右键菜单：加入/移出浮窗、删除
+    ├── _table_context_menu()  # 右键菜单：加入/移出浮窗、删除
+    └── _open_analysis()       # 打开股票分析（回测）窗口
 ```
 
 ---
@@ -191,6 +238,7 @@ stock_monitor.py
 | 代码搜索/secid | `searchapi.eastmoney.com/api/suggest/get` | 东方财富，支持任意代码格式 |
 | 历史K线（主） | `web.ifzq.gtimg.cn/appstock/app/fqkline/get` | 腾讯，前复权日K，拉 80 日，风控松 |
 | 历史K线（兜底） | `push2his.eastmoney.com/api/qt/stock/kline/get` | 东方财富，secid 直查，覆盖 A50 期指等腾讯不支持的品种 |
+| 回测历史K线 | 同上两个 fqkline / push2his | 前复权，一次请求返回整段：最近N天用 count，起止日期用区间参数（腾讯按跨度放大 count 封顶 2000，东财用 beg/end） |
 | 实时行情（盘中高精度价/量比） | `qt.gtimg.cn/q={前缀+代码}` | 腾讯，f[3]=价格 f[32]=涨跌幅 f[38]=换手率 f[49]=量比 |
 | 成交额历史（指数） | `web.ifzq.gtimg.cn/appstock/app/newfqkline/get` | 腾讯，带成交额字段（索引8，万元），拉 60 日，不限流 |
 | 成交额当日（指数） | `qt.gtimg.cn/q={前缀+代码}` | 腾讯实时，字段37为当日成交额（万元） |
@@ -226,11 +274,20 @@ stock_monitor.py
     "vol_m": 20,
     "float_bg": "#2c3e50",
     "float_font_color": "#ffffff",
-    "t_strategy": {"600519": 1, "159995": 3}
+    "t_strategy": {"600519": 1, "159995": 3},
+    "analysis_rows": [
+        {
+            "code": "600519", "mode": "range",
+            "days": 0, "start": "2024-01-01", "end": "2024-06-01",
+            "buy":  [{"type": "ma_above", "param": 8}],
+            "sell": [{"type": "ma_below", "param": 10}]
+        }
+    ]
 }
 ```
 
 > `t_strategy`：股票代码 → 我的做T策略下拉框索引（0 空 / 1 强势 / 2 震荡 / 3 弱势）。
+> `analysis_rows`：股票分析窗口各行配置。`mode` 为 `days`（用 `days`）或 `range`（用 `start`/`end`）；`buy`/`sell` 为条件列表，`type` ∈ `ma_above`/`ma_below`/`cooldown`，`param` 为日线周期或冷却天数。
 
 ---
 

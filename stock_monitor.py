@@ -11,8 +11,9 @@
   - FloatWidget           : 无边框置顶浮窗，支持任意数量股票，每只一行(价格+涨跌幅)
   - MainWindow            : 主窗口，表格+定时刷新+右键菜单+托盘
   - fetch_kline_daily()   : 回测用带日期日K（腾讯优先/东财兜底），支持最近N天或起止日期区间
-  - run_backtest()        : MA交叉回测——站上N日线买入/跌破M日线卖出，10000股基数，算盈亏/胜率/回撤
-  - AnalysisWindow        : 「股票分析」窗口，多行表格，每行一条策略，BacktestWorker后台跑，结果弹窗
+  - run_backtest()        : 多条件回测——买入/卖出各一组条件(AND)，10000股基数，算盈亏/胜率/回撤
+                            条件类型见 COND_TYPES：站上X日线/跌破X日线/上次卖出后超过X天
+  - AnalysisWindow        : 「股票分析」窗口，多行表格，每行买入+卖出两列可增删条件，后台跑，结果弹窗
 
 数据接口（如接口挂了看这里换）：
   - 代码搜索: https://searchapi.eastmoney.com/api/suggest/get  (东方财富，任意代码 → secid)
@@ -394,12 +395,27 @@ def _fetch_kline_daily_eastmoney(secid, start="", end="", count=320):
     return out or None
 
 
+# 单次日K最多拉取的交易日数（约 8 年）。腾讯 count 只作上限：默认 320 会把区间
+# 截成「最近 320 个交易日」，所以区间模式必须按日历跨度把 count 放大到覆盖整个区间。
+MAX_KLINE_COUNT = 2000
+
+
 def fetch_kline_daily(code, start="", end="", count=320):
     """回测用日K：code → (name, [(date, close), ...] 升序)。优先腾讯，东财兜底。
     start/end 传 'YYYY-MM-DD' 拉区间；留空则用 count 拉最近 count 天。
     """
     secid, name = search_secid(code)
     tc = _get_tencent_prefix(secid)
+    # 区间模式：count 仅是行数上限，默认 320 会把 start 截断成最近 320 个交易日。
+    # 按日历跨度把 count 抬高到足以覆盖整个区间（封顶 MAX_KLINE_COUNT），让 start 生效。
+    if start:
+        end_ref = end or time.strftime("%Y-%m-%d")
+        try:
+            span_days = (datetime.datetime.strptime(end_ref, "%Y-%m-%d")
+                         - datetime.datetime.strptime(start, "%Y-%m-%d")).days
+        except ValueError:
+            span_days = count
+        count = min(MAX_KLINE_COUNT, max(count, span_days + 30))
     series = _fetch_kline_daily_tencent(tc, start, end, count)
     if series is None:
         series = _fetch_kline_daily_eastmoney(secid, start, end, count)
@@ -408,25 +424,59 @@ def fetch_kline_daily(code, start="", end="", count=320):
     return name, series
 
 
-def run_backtest(dates, closes, buy_period, sell_period, start_idx, shares=10000):
-    """MA 交叉回测：空仓且收盘 > buy_period 日均线 → 买入 shares 股；
-    持仓且收盘 < sell_period 日均线 → 全部卖出。逐日推进（信号在 start_idx 起生效）。
+# 条件类型：type → (归属, 显示模板)。param 为条件参数（日线周期 / 天数）
+COND_TYPES = {
+    "ma_above": ("buy",  "站上{p}日线"),        # 收盘 > MA(param)
+    "cooldown": ("buy",  "距上次卖出>{p}天"),    # 距上次卖出超过 param 个交易日
+    "ma_below": ("sell", "跌破{p}日线"),         # 收盘 < MA(param)
+}
+
+
+def _cond_met(cond, closes, i, last_sell_idx):
+    """单个条件在第 i 根K线是否成立。"""
+    t, p = cond["type"], cond["param"]
+    if t == "ma_above":
+        if i < p - 1:
+            return False
+        return closes[i] > sum(closes[i - p + 1:i + 1]) / p
+    if t == "ma_below":
+        if i < p - 1:
+            return False
+        return closes[i] < sum(closes[i - p + 1:i + 1]) / p
+    if t == "cooldown":
+        if last_sell_idx is None:
+            return True                      # 从未卖出过 → 无冷却限制
+        return (i - last_sell_idx) > p
+    return False
+
+
+def conds_desc(conds):
+    """把条件列表拼成中文描述，如 '站上5日线 且 距上次卖出>3天'。"""
+    parts = []
+    for c in conds:
+        tpl = COND_TYPES.get(c["type"], (None, "?"))[1]
+        parts.append(tpl.format(p=c["param"]))
+    return " 且 ".join(parts) if parts else "（无条件）"
+
+
+def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
+    """多条件回测：空仓且全部买入条件成立 → 买入 shares 股；
+    持仓且全部卖出条件成立 → 全部卖出。逐日推进（信号在 start_idx 起生效）。
+    某侧条件列表为空则该侧永不触发。毛收益口径（不计手续费）。
 
     返回 dict：
-      trades  : [{date, side, price, shares, pnl}]  side ∈ {'买入','卖出'}
-      summary : {total_pnl, return_pct, principal, final_equity, holding}
-      stats   : {trade_count, win_rate, max_drawdown, holding, buy_period, sell_period}
-    毛收益口径（不计手续费）。期末仍持仓则按最后一根收盘价市值计入。
+      trades   : [{date, side, price, shares, pnl}]  side ∈ {'买入','卖出'}
+      summary  : {total_pnl, return_pct, principal, final_equity, holding}
+      buy_hold : {has_buy, buy_date, buy_price, pnl, return_pct}  首个买点买入并持有到期末的对照
+      stats    : {trade_count, win_rate, max_drawdown, holding, buy_desc, sell_desc}
     """
-    def ma(i, n):
-        return sum(closes[i - n + 1:i + 1]) / n
-
     trades = []
     holding = False
     buy_price = 0.0
     realized = 0.0            # 已实现盈亏累计
     wins = 0
     round_trips = 0
+    last_sell_idx = None      # 上次卖出的K线索引（冷却条件用）
     equity_curve = []         # 逐日盯市权益（相对本金的浮动，用于最大回撤）
 
     n = len(closes)
@@ -436,29 +486,47 @@ def run_backtest(dates, closes, buy_period, sell_period, start_idx, shares=10000
         floating = (price - buy_price) * shares if holding else 0.0
         equity_curve.append(realized + floating)
 
-        if not holding and i >= buy_period - 1 and price > ma(i, buy_period):
-            holding = True
-            buy_price = price
-            trades.append({"date": dates[i], "side": "买入", "price": price,
-                           "shares": shares, "pnl": None})
-        elif holding and i >= sell_period - 1 and price < ma(i, sell_period):
-            pnl = (price - buy_price) * shares
-            realized += pnl
-            round_trips += 1
-            if pnl > 0:
-                wins += 1
-            holding = False
-            trades.append({"date": dates[i], "side": "卖出", "price": price,
-                           "shares": shares, "pnl": pnl})
+        if not holding:
+            if buy_conds and all(_cond_met(c, closes, i, last_sell_idx) for c in buy_conds):
+                holding = True
+                buy_price = price
+                trades.append({"date": dates[i], "side": "买入", "price": price,
+                               "shares": shares, "pnl": None})
+        else:
+            if sell_conds and all(_cond_met(c, closes, i, last_sell_idx) for c in sell_conds):
+                pnl = (price - buy_price) * shares
+                realized += pnl
+                round_trips += 1
+                if pnl > 0:
+                    wins += 1
+                holding = False
+                last_sell_idx = i
+                trades.append({"date": dates[i], "side": "卖出", "price": price,
+                               "shares": shares, "pnl": pnl})
 
     # 期末仍持仓：按最后一根收盘价计未实现盈亏
     last_price = closes[-1] if n else 0.0
     unrealized = (last_price - buy_price) * shares if holding else 0.0
     total_pnl = realized + unrealized
 
-    first_buy = next((t["price"] for t in trades if t["side"] == "买入"), 0.0)
+    first_buy_trade = next((t for t in trades if t["side"] == "买入"), None)
+    first_buy = first_buy_trade["price"] if first_buy_trade else 0.0
     principal = first_buy * shares
     return_pct = (total_pnl / principal * 100) if principal else 0.0
+
+    # 买入并持有对照：首个买点买入 shares 股，忽略卖出策略，持有到区间末按末日收盘价计
+    if first_buy_trade:
+        bh_pnl = (last_price - first_buy) * shares
+        buy_hold = {
+            "has_buy": True,
+            "buy_date": first_buy_trade["date"],
+            "buy_price": first_buy,
+            "pnl": bh_pnl,
+            "return_pct": (bh_pnl / principal * 100) if principal else 0.0,
+        }
+    else:
+        buy_hold = {"has_buy": False, "buy_date": None, "buy_price": 0.0,
+                    "pnl": 0.0, "return_pct": 0.0}
 
     # 最大回撤：权益曲线峰值到谷底的最大跌幅（金额）
     max_dd = 0.0
@@ -476,13 +544,14 @@ def run_backtest(dates, closes, buy_period, sell_period, start_idx, shares=10000
             "final_equity": principal + total_pnl,
             "holding": holding,
         },
+        "buy_hold": buy_hold,
         "stats": {
             "trade_count": round_trips,
             "win_rate": (wins / round_trips * 100) if round_trips else 0.0,
             "max_drawdown": max_dd,
             "holding": holding,
-            "buy_period": buy_period,
-            "sell_period": sell_period,
+            "buy_desc": conds_desc(buy_conds),
+            "sell_desc": conds_desc(sell_conds),
         },
     }
 
@@ -829,7 +898,7 @@ class BacktestWorker(QThread):
     result = pyqtSignal(int, str, str, str)
     error = pyqtSignal(int, str, str)
 
-    def __init__(self, row_id, code, mode, days, start, end, buy_period, sell_period):
+    def __init__(self, row_id, code, mode, days, start, end, buy_conds, sell_conds):
         super().__init__()
         self.row_id = row_id
         self.code = code
@@ -837,30 +906,93 @@ class BacktestWorker(QThread):
         self.days = days
         self.start_date = start   # 不能叫 self.start：会覆盖 QThread.start() 方法
         self.end_date = end
-        self.buy_period = buy_period
-        self.sell_period = sell_period
+        self.buy_conds = buy_conds
+        self.sell_conds = sell_conds
 
     def run(self):
         try:
-            # 均线预热：多取 max(周期) 的 trading day，range 模式按日历日折算前移起点
-            pad = max(self.buy_period, self.sell_period) * 2 + 20
+            # 均线预热：取所有均线类条件里最大周期，多留若干 trading day
+            ma_params = [c["param"] for c in self.buy_conds + self.sell_conds
+                         if c["type"] in ("ma_above", "ma_below")]
+            pad = (max(ma_params) if ma_params else 5) * 2 + 20
             if self.mode == "range":
                 sd = datetime.datetime.strptime(self.start_date, "%Y-%m-%d") - datetime.timedelta(days=pad * 2)
                 name, series = fetch_kline_daily(self.code, sd.strftime("%Y-%m-%d"), self.end_date)
             else:
                 name, series = fetch_kline_daily(self.code, count=self.days + pad)
             dates, closes, start_idx = _resolve_backtest_window(series, self.mode, self.days, self.start_date)
-            report = run_backtest(dates, closes, self.buy_period, self.sell_period, start_idx)
+            report = run_backtest(dates, closes, self.buy_conds, self.sell_conds, start_idx)
             report["window"] = {"first": dates[start_idx], "last": dates[-1]}
             self.result.emit(self.row_id, self.code, name, json.dumps(report))
         except Exception as e:
             self.error.emit(self.row_id, self.code, str(e))
 
 
+class NameLookupWorker(QThread):
+    """后台查股票名（search_secid 有缓存），done 发出 name（查不到发 ''）。"""
+    done = pyqtSignal(str)
+
+    def __init__(self, code):
+        super().__init__()
+        self.code = code
+
+    def run(self):
+        try:
+            _secid, name = search_secid(self.code)
+        except Exception:
+            name = ""
+        self.done.emit(name)
+
+
+class _CodeCell(QWidget):
+    """股票代码单元格：左输入框，右显示股票名（输入完成后台查一次）。value() 返回代码。"""
+    changed = pyqtSignal()
+
+    def __init__(self, code=""):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(2)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("如 600519")
+        self.edit.setFixedWidth(90)
+        self.name_lbl = QLabel("")
+        self.name_lbl.setStyleSheet("color:#666;")
+        lay.addWidget(self.edit)
+        lay.addWidget(self.name_lbl)
+        self._worker = None
+        self.edit.editingFinished.connect(self._lookup)
+        self.edit.editingFinished.connect(self.changed)
+        if code:                       # 从配置回填：填入并后台查一次股票名
+            self.edit.setText(code)
+            self._lookup()
+
+    def _lookup(self):
+        code = self.edit.text().strip().upper()
+        if len(code) < 2:
+            self.name_lbl.setText("")
+            return
+        self.name_lbl.setText("查询中…")
+        self._worker = NameLookupWorker(code)
+        self._worker.done.connect(self._on_name)
+        self._worker.start()
+
+    def _on_name(self, name):
+        self.name_lbl.setText(name if name else "未找到")
+
+    def set_name(self, name):
+        if name:
+            self.name_lbl.setText(name)
+
+    def value(self):
+        return self.edit.text().strip().upper()
+
+
 class _TimeTypeCell(QWidget):
     """时间类型单元格：下拉切换「最近N天 / 起止日期」，返回 (mode, days, start, end)。"""
+    changed = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, mode="days", days=60, start="", end=""):
         super().__init__()
         lay = QHBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
@@ -876,7 +1008,7 @@ class _TimeTypeCell(QWidget):
         dl.setContentsMargins(0, 0, 0, 0)
         self.days_spin = QSpinBox()
         self.days_spin.setRange(5, 1000)
-        self.days_spin.setValue(60)
+        self.days_spin.setValue(days or 60)
         self.days_spin.setFixedWidth(70)
         dl.addWidget(self.days_spin)
         dl.addWidget(QLabel("天"))
@@ -885,8 +1017,10 @@ class _TimeTypeCell(QWidget):
         rl = QHBoxLayout(page_range)
         rl.setContentsMargins(0, 0, 0, 0)
         today = QDate.currentDate()
-        self.start_edit = QDateEdit(today.addMonths(-3))
-        self.end_edit = QDateEdit(today)
+        sd = QDate.fromString(start, "yyyy-MM-dd") if start else today.addMonths(-3)
+        ed = QDate.fromString(end, "yyyy-MM-dd") if end else today
+        self.start_edit = QDateEdit(sd if sd.isValid() else today.addMonths(-3))
+        self.end_edit = QDateEdit(ed if ed.isValid() else today)
         for de in (self.start_edit, self.end_edit):
             de.setCalendarPopup(True)
             de.setDisplayFormat("yyyy-MM-dd")
@@ -898,6 +1032,13 @@ class _TimeTypeCell(QWidget):
         self.stack.addWidget(page_range)
         lay.addWidget(self.stack)
         self.combo.currentIndexChanged.connect(self.stack.setCurrentIndex)
+        if mode == "range":
+            self.combo.setCurrentIndex(1)      # 联动 stack 切到起止日期页
+        # 任意变更 → 通知外层持久化
+        self.combo.currentIndexChanged.connect(self.changed)
+        self.days_spin.valueChanged.connect(self.changed)
+        self.start_edit.dateChanged.connect(self.changed)
+        self.end_edit.dateChanged.connect(self.changed)
 
     def value(self):
         if self.combo.currentIndex() == 0:
@@ -907,30 +1048,93 @@ class _TimeTypeCell(QWidget):
                 self.end_edit.date().toString("yyyy-MM-dd"))
 
 
-class _StrategyCell(QWidget):
-    """买卖策略单元格：站上[N]日线买入　跌破[M]日线卖出，返回 (buy_period, sell_period)。"""
+class _ConditionsCell(QWidget):
+    """可增删的多条件单元格。kind='buy'/'sell' 决定可选条件类型。
+    value() 返回 [{'type':..., 'param':int}, ...]，多条件为「同时满足」(AND)。
+    conditions_changed 在增删条件时发出，供外层重算行高。
+    """
+    conditions_changed = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, kind="buy", conds=None):
         super().__init__()
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(3)
-        self.buy_spin = QSpinBox()
-        self.buy_spin.setRange(1, 250)
-        self.buy_spin.setValue(5)
-        self.buy_spin.setMinimumWidth(72)
-        self.sell_spin = QSpinBox()
-        self.sell_spin.setRange(1, 250)
-        self.sell_spin.setValue(10)
-        self.sell_spin.setMinimumWidth(72)
-        lay.addWidget(QLabel("站上"))
-        lay.addWidget(self.buy_spin)
-        lay.addWidget(QLabel("日线买入  跌破"))
-        lay.addWidget(self.sell_spin)
-        lay.addWidget(QLabel("日线卖出"))
+        self.kind = kind
+        # 该 kind 可选的条件类型：[(type, 显示名), ...]
+        self._types = [(t, COND_TYPES[t][1].replace("{p}", "X"))
+                       for t, (owner, _tpl) in COND_TYPES.items() if owner == kind]
+
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(2, 2, 2, 2)
+        self._outer.setSpacing(2)
+        self._rows_box = QVBoxLayout()
+        self._rows_box.setSpacing(2)
+        self._outer.addLayout(self._rows_box)
+
+        add_btn = QPushButton("＋ 添加条件")
+        add_btn.setFixedHeight(22)
+        add_btn.clicked.connect(lambda: self._add_condition())
+        self._outer.addWidget(add_btn)
+
+        self._rows = []   # [(row_widget, type_combo, param_spin)]
+        if conds:                       # 从配置回填已保存的条件
+            for c in conds:
+                self._add_condition(default_type=c.get("type"), param=c.get("param"))
+        else:                           # 默认给一条条件
+            self._add_condition(default_type=self._types[0][0])
+
+    def _add_condition(self, default_type=None, param=None):
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(3)
+
+        combo = QComboBox()
+        for _t, label in self._types:
+            combo.addItem(label)
+        if default_type:
+            idx = next((i for i, (t, _l) in enumerate(self._types) if t == default_type), 0)
+            combo.setCurrentIndex(idx)
+
+        spin = QSpinBox()
+        spin.setRange(1, 250)
+        spin.setValue(param if param is not None else (5 if self.kind == "buy" else 10))
+        spin.setMinimumWidth(66)
+
+        del_btn = QPushButton("－")
+        del_btn.setFixedSize(24, 22)
+        del_btn.clicked.connect(lambda: self._del_condition(row))
+
+        # 类型/参数变更也通过 conditions_changed 通知外层（既重算行高也触发持久化）
+        combo.currentIndexChanged.connect(self.conditions_changed)
+        spin.valueChanged.connect(self.conditions_changed)
+
+        rl.addWidget(combo)
+        rl.addWidget(spin)
+        rl.addWidget(del_btn)
+        rl.addStretch()
+
+        self._rows_box.addWidget(row)
+        self._rows.append((row, combo, spin))
+        self._outer.activate()      # 立即重算布局，让 sizeHint 反映新增的条件行
+        self.updateGeometry()
+        self.conditions_changed.emit()
+
+    def _del_condition(self, row):
+        for i, (w, _c, _s) in enumerate(self._rows):
+            if w is row:
+                self._rows.pop(i)
+                w.setParent(None)
+                w.deleteLater()
+                break
+        self._outer.activate()
+        self.updateGeometry()
+        self.conditions_changed.emit()
 
     def value(self):
-        return self.buy_spin.value(), self.sell_spin.value()
+        out = []
+        for _w, combo, spin in self._rows:
+            ctype = self._types[combo.currentIndex()][0]
+            out.append({"type": ctype, "param": spin.value()})
+        return out
 
 
 class BacktestResultDialog(QDialog):
@@ -951,7 +1155,7 @@ class BacktestResultDialog(QDialog):
         pnl_color = red if s["total_pnl"] > 0 else (green if s["total_pnl"] < 0 else gray)
         summary = QLabel(
             f"<b>区间</b>：{win.get('first', '?')} ~ {win.get('last', '?')}　"
-            f"<b>策略</b>：站上{st['buy_period']}日线买 / 跌破{st['sell_period']}日线卖　(10000股/笔)<br>"
+            f"<b>买入</b>：{st['buy_desc']}　<b>卖出</b>：{st['sell_desc']}　(10000股/笔)<br>"
             f"<b>总盈亏</b>：<span style='color:{pnl_color}'>{s['total_pnl']:+,.2f} 元</span>　"
             f"<b>收益率</b>：<span style='color:{pnl_color}'>{s['return_pct']:+.2f}%</span><br>"
             f"<b>本金(首次买入)</b>：{s['principal']:,.2f} 元　"
@@ -971,6 +1175,26 @@ class BacktestResultDialog(QDialog):
         )
         stats.setStyleSheet("color:#555; font-size:12px;")
         lay.addWidget(stats)
+
+        # ── 买入并持有对照 ──
+        bh = report.get("buy_hold", {"has_buy": False})
+        if bh["has_buy"]:
+            bh_color = red if bh["pnl"] > 0 else (green if bh["pnl"] < 0 else gray)
+            diff = s["return_pct"] - bh["return_pct"]          # 策略收益率 − 持有收益率
+            diff_color = red if diff > 0 else (green if diff < 0 else gray)
+            diff_txt = "策略跑赢" if diff > 0 else ("策略跑输" if diff < 0 else "打平")
+            buyhold = QLabel(
+                f"<b>买入并持有对照</b>（首个买点 {bh['buy_date']}@{bh['buy_price']:.4f} → 期末，不执行卖出）<br>"
+                f"总盈亏：<span style='color:{bh_color}'>{bh['pnl']:+,.2f} 元</span>　"
+                f"收益率：<span style='color:{bh_color}'>{bh['return_pct']:+.2f}%</span>　"
+                f"<span style='color:{diff_color}'>{diff_txt} {abs(diff):.2f}%</span>"
+            )
+        else:
+            buyhold = QLabel("<b>买入并持有对照</b>：该区间未触发买入信号，无对照。")
+        buyhold.setTextFormat(Qt.TextFormat.RichText)
+        buyhold.setWordWrap(True)
+        buyhold.setStyleSheet("font-size:12px;")
+        lay.addWidget(buyhold)
 
         # ── 交易明细表 ──
         trades = report["trades"]
@@ -1006,14 +1230,21 @@ class BacktestResultDialog(QDialog):
 
 
 class AnalysisWindow(QWidget):
-    """股票分析（回测）窗口：多行表格，每行一条 MA 交叉策略回测。"""
+    """股票分析（回测）窗口：多行表格，每行独立的买入/卖出多条件策略回测。"""
 
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
         self.setWindowTitle("股票分析 · 策略回测")
-        self.resize(820, 420)
+        self.resize(1000, 460)
+        self.config = config if config is not None else load_config()
+        self._loading = False    # 回填已存配置时置 True，避免触发保存
         self._next_row_id = 0
-        self._workers = {}    # row_id → BacktestWorker（持引用防 GC）
+        self._workers = {}       # row_id → BacktestWorker（持引用防 GC）
+        self._code_cells = {}    # row_id → _CodeCell（回测返回后回填股票名）
+        self._save_timer = QTimer(self)      # 变更防抖：多次快速改动只落盘一次
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(400)
+        self._save_timer.timeout.connect(self._save_rows)
 
         lay = QVBoxLayout(self)
         top = QHBoxLayout()
@@ -1021,29 +1252,48 @@ class AnalysisWindow(QWidget):
         btn_add.setFixedWidth(90)
         btn_add.clicked.connect(self._add_row)
         top.addWidget(btn_add)
-        top.addWidget(QLabel("按 10000 股为买卖基数回测，毛收益（不计手续费）"))
+        top.addWidget(QLabel("每列多条件为「同时满足」；按 10000 股为买卖基数，毛收益（不计手续费）"))
         top.addStretch()
         lay.addLayout(top)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["股票代码", "时间类型", "买卖策略", "操作"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["股票代码", "时间类型", "买入策略", "卖出策略", "操作"])
         h = self.table.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.verticalHeader().setDefaultSectionSize(40)
+        for i in range(5):
+            h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.verticalHeader().setDefaultSectionSize(56)
         lay.addWidget(self.table)
 
-        self._add_row()   # 默认给一行
+        saved = self.config.get("analysis_rows") or []
+        if saved:                        # 回填上次保存的各行
+            self._loading = True
+            for d in saved:
+                self._add_row(d)
+            self._loading = False
+        else:
+            self._add_row()              # 默认给一行
 
-    def _add_row(self):
+    def _add_row(self, data=None):
+        d = data if isinstance(data, dict) else {}
         r = self.table.rowCount()
         self.table.insertRow(r)
-        self.table.setItem(r, 0, QTableWidgetItem(""))
-        self.table.setCellWidget(r, 1, _TimeTypeCell())
-        self.table.setCellWidget(r, 2, _StrategyCell())
+        code_cell = _CodeCell(d.get("code", ""))
+        time_cell = _TimeTypeCell(d.get("mode", "days"), d.get("days", 60),
+                                  d.get("start", ""), d.get("end", ""))
+        self.table.setCellWidget(r, 0, code_cell)
+        self.table.setCellWidget(r, 1, time_cell)
+        buy_cell = _ConditionsCell("buy", d.get("buy"))
+        sell_cell = _ConditionsCell("sell", d.get("sell"))
+        buy_cell.conditions_changed.connect(self._resize_rows_deferred)
+        sell_cell.conditions_changed.connect(self._resize_rows_deferred)
+        # 任意单元格变更 → 防抖持久化
+        code_cell.changed.connect(self._schedule_save)
+        time_cell.changed.connect(self._schedule_save)
+        buy_cell.conditions_changed.connect(self._schedule_save)
+        sell_cell.conditions_changed.connect(self._schedule_save)
+        self.table.setCellWidget(r, 2, buy_cell)
+        self.table.setCellWidget(r, 3, sell_cell)
 
         op = QWidget()
         ol = QHBoxLayout(op)
@@ -1057,11 +1307,40 @@ class AnalysisWindow(QWidget):
         btn_del.clicked.connect(lambda: self._del_row(op))
         ol.addWidget(btn_run)
         ol.addWidget(btn_del)
-        self.table.setCellWidget(r, 3, op)
+        self.table.setCellWidget(r, 4, op)
+        self.table.resizeRowsToContents()
+        self._schedule_save()
+
+    def _schedule_save(self):
+        """请求持久化（防抖）；回填配置期间不保存。"""
+        if not self._loading:
+            self._save_timer.start()
+
+    def _save_rows(self):
+        """把当前所有行序列化写入 config.analysis_rows。"""
+        rows = []
+        for r in range(self.table.rowCount()):
+            mode, days, start, end = self.table.cellWidget(r, 1).value()
+            rows.append({
+                "code": self.table.cellWidget(r, 0).value(),
+                "mode": mode, "days": days, "start": start, "end": end,
+                "buy": self.table.cellWidget(r, 2).value(),
+                "sell": self.table.cellWidget(r, 3).value(),
+            })
+        self.config["analysis_rows"] = rows
+        save_config(self.config)
+
+    def closeEvent(self, e):
+        self._save_rows()                # 关窗兜底保存一次
+        super().closeEvent(e)
+
+    def _resize_rows_deferred(self):
+        # 延到事件循环下一拍再量行高，确保单元格布局已重算（否则首次加条件行高不变）
+        QTimer.singleShot(0, self.table.resizeRowsToContents)
 
     def _widget_row(self, widget):
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 3) is widget:
+            if self.table.cellWidget(r, 4) is widget:
                 return r
         return -1
 
@@ -1069,17 +1348,26 @@ class AnalysisWindow(QWidget):
         r = self._widget_row(op_widget)
         if r >= 0:
             self.table.removeRow(r)
+            self._schedule_save()
 
     def _run_row(self, op_widget):
         r = self._widget_row(op_widget)
         if r < 0:
             return
-        code = self.table.item(r, 0).text().strip().upper()
+        code_cell = self.table.cellWidget(r, 0)
+        code = code_cell.value()
         if not code or len(code) < 2:
             QMessageBox.warning(self, "提示", "请先填写股票代码")
             return
         mode, days, start, end = self.table.cellWidget(r, 1).value()
-        buy_period, sell_period = self.table.cellWidget(r, 2).value()
+        buy_conds = self.table.cellWidget(r, 2).value()
+        sell_conds = self.table.cellWidget(r, 3).value()
+        if not buy_conds:
+            QMessageBox.warning(self, "提示", "请至少添加一个买入条件")
+            return
+        if not sell_conds:
+            QMessageBox.warning(self, "提示", "请至少添加一个卖出条件")
+            return
         if mode == "range" and start > end:
             QMessageBox.warning(self, "提示", "起始日期不能晚于截止日期")
             return
@@ -1091,19 +1379,24 @@ class AnalysisWindow(QWidget):
 
         rid = self._next_row_id
         self._next_row_id += 1
-        worker = BacktestWorker(rid, code, mode, days, start, end, buy_period, sell_period)
+        worker = BacktestWorker(rid, code, mode, days, start, end, buy_conds, sell_conds)
         worker.result.connect(self._on_result)
         worker.error.connect(self._on_error)
         worker.finished.connect(lambda w=worker, b=btn_run: self._on_done(w, b))
         self._workers[rid] = worker
+        self._code_cells[rid] = code_cell
         worker.start()
 
     def _on_done(self, worker, btn_run):
         btn_run.setEnabled(True)
         btn_run.setText("确定")
         self._workers.pop(worker.row_id, None)
+        self._code_cells.pop(worker.row_id, None)
 
     def _on_result(self, row_id, code, name, report_json):
+        cell = self._code_cells.get(row_id)
+        if cell is not None:
+            cell.set_name(name)   # 回填股票名（编辑时若未触发查询也能补上）
         report = json.loads(report_json)
         dlg = BacktestResultDialog(code, name, report, self)
         dlg.exec()
@@ -1260,7 +1553,7 @@ class MainWindow(QMainWindow):
     def _open_analysis(self):
         """打开股票分析（回测）窗口，已开则前置。"""
         if self._analysis_win is None:
-            self._analysis_win = AnalysisWindow()
+            self._analysis_win = AnalysisWindow(self.config)
         self._analysis_win.show()
         self._analysis_win.raise_()
         self._analysis_win.activateWindow()

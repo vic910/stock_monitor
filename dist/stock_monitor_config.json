@@ -1,6 +1,7 @@
 {
     "stocks": [
         "159995",
+        "上证指数",
         "513050",
         "513120",
         "159131",
@@ -24,5 +25,68 @@
         "159131": 2,
         "510300": 2,
         "600519": 2
-    }
+    },
+    "analysis_rows": [
+        {
+            "code": "513050",
+            "mode": "range",
+            "days": 0,
+            "start": "2024-09-24",
+            "end": "2026-08-24",
+            "buy": [
+                {
+                    "type": "ma_above",
+                    "param": 10
+                }
+            ],
+            "sell": [
+                {
+                    "type": "ma_below",
+                    "param": 10
+                }
+            ]
+        },
+        {
+            "code": "159995",
+            "mode": "range",
+            "days": 0,
+            "start": "2026-05-07",
+            "end": "2026-08-24",
+            "buy": [
+                {
+                    "type": "ma_above",
+                    "param": 5
+                }
+            ],
+            "sell": [
+                {
+                    "type": "ma_below",
+                    "param": 5
+                }
+            ]
+        },
+        {
+            "code": "601318",
+            "mode": "range",
+            "days": 0,
+            "start": "2025-07-21",
+            "end": "2026-08-24",
+            "buy": [
+                {
+                    "type": "ma_above",
+                    "param": 10
+                },
+                {
+                    "type": "cooldown",
+                    "param": 5
+                }
+            ],
+            "sell": [
+                {
+                    "type": "ma_below",
+                    "param": 5
+                }
+            ]
+        }
+    ]
 }
