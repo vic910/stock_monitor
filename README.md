@@ -34,7 +34,7 @@ dist\stock_monitor.exe
 | 排序 | 每行末尾 ↑↓ 按钮点击调整顺序；⠿ 按钮长按拖拽插入任意位置，自动持久化 |
 | 常驻浮窗 | 支持任意数量股票，置顶显示，每行显示价格/涨跌幅/量比，整体可拖动；右键可修改背景色/字体颜色 |
 | 系统托盘 | 最小化后缩至右下角托盘图标，双击恢复，右键退出 |
-| 股票分析（回测） | 独立窗口，多行策略回测：站上/跌破X日线、上次卖出后冷却N天等多条件（同时满足），输出交易明细+盈亏收益率+统计指标+买入持有对照，10000股基数（见下节） |
+| 股票分析（回测） | 独立窗口，多行策略回测：站上/跌破X日线、冷却N天、MACD金叉/死叉、突破上次卖点（或条件）等多条件，点「确定」直接打开K线买卖点窗口（汇总+统计+买入持有对照+K线折线标买卖点+交易明细），10000股基数（见下节） |
 | 配置持久化 | 股票列表/刷新间隔/N/M参数/浮窗背景色/浮窗字体颜色/我的做T策略/股票分析各行 自动保存 |
 
 ---
@@ -158,25 +158,33 @@ N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保
 |---|---|
 | 股票代码 | 输入框（上）+ 股票名（下，输入完成后台查一次） |
 | 时间类型 | 下拉切换：**最近N天**（5~1000）/ **起止日期**（日历选择） |
-| 买入策略 | 可增删的多条件，「同时满足」才买入 |
+| 买入策略 | 分「且（全部满足）」和「或（满足即买）」两组，可各自增删条件 |
 | 卖出策略 | 可增删的多条件，「同时满足」才卖出 |
 | 操作 | 确定（跑回测）/ 删除（删行） |
 
 **条件类型：**
 
-| 归属 | 类型 | 含义 |
-|---|---|---|
-| 买入 | 站上X日线 | 收盘价 > MA(X) |
-| 买入 | 距上次卖出>X天 | 距上次卖出超过 X 个交易日才允许再买（冷却） |
-| 卖出 | 跌破X日线 | 收盘价 < MA(X) |
+| 归属 | 组 | 类型 | 含义 |
+|---|---|---|---|
+| 买入 | 且 | 站上X日线 | 收盘价 > MA(X) |
+| 买入 | 且 | 距上次卖出>X天 | 距上次卖出超过 X 个交易日才允许再买（冷却） |
+| 买入 | 且 | MACD金叉 | DIF 上穿 DEA（固定 12/26/9） |
+| 买入 | 或 | 突破上次卖点 | 收盘价 > 上一次卖出价（与「且」组并列取或） |
+| 卖出 | — | 跌破X日线 | 收盘价 < MA(X) |
+| 卖出 | — | MACD死叉 | DIF 下穿 DEA（固定 12/26/9） |
 
-**回测规则：** 空仓且买入条件全满足 → 买入 10000 股；持仓且卖出条件全满足 → 全部卖出。逐日推进，毛收益（不计手续费）。为让均线在区间起点即有效，会自动向前多拉一段数据预热。
+**买入组合逻辑：** `（「且」组全部满足） 或 （任一「或」条件满足）`。界面上两组上下分开，各有独立的下拉与「＋添加」按钮。MACD 金叉/死叉、突破上次卖点为无参数条件（参数框置灰）。
 
-**结果弹窗：**
+**回测规则：** 空仓且买入逻辑成立 → 买入 10000 股；持仓且卖出条件全满足 → 全部卖出。逐日推进，毛收益（不计手续费）。为让均线/MACD 在区间起点即有效，会自动向前多拉一段数据预热。
+
+**取数缓存：** 同一行重复点「确定」时，只要**时间段没变**（且为当天）就复用上次拉取的日K、不再联网——改买卖条件（含均线周期）都不会触发请求；换时间段或隔天才重新拉取。
+
+**结果窗口（点确定直接打开）：**
 
 - **汇总**：区间、买卖策略描述、总盈亏、收益率、本金（首次买入）、期末资产
 - **统计**：交易次数（完整来回）、胜率、最大回撤、期末是否持仓
 - **买入并持有对照**：用首个买点买入并持有到区间末（不执行卖出）的盈亏与收益率，并标注策略相对持有「跑赢/跑输」多少
+- **K线折线（QPainter手绘）**：收盘价走势，买点红/卖点绿标在线上，鼠标悬停某点显示其日期/价格/单笔盈亏（盈亏红正绿负）
 - **交易明细表**：每笔买卖的日期、方向、价格、股数、单笔盈亏
 
 > 每行的代码/时间类型/买卖条件在改动后自动保存（防抖），重启后自动还原（`config.analysis_rows`）。
@@ -189,16 +197,18 @@ N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保
 stock_monitor.py
 ├── search_secid(code)         # 东方财富搜索接口：code → (secid, name)，内存缓存
 ├── fetch_stock_data(code)     # 组合K线源+实时价：拉80日历史，返回价格/涨跌幅/MA5-60/成交量/收盘价列表
-│   ├── _fetch_kline_tencent(tc)     # 腾讯K线(主，风控松)：A股/ETF/港股/恒指
+│   ├── _fetch_kline_tencent(tc)     # 腾讯K线(主，风控松，用newfqkline)：A股/ETF/港股/恒指；任何异常返回None降级
 │   └── _fetch_kline_eastmoney(secid)# 东财K线(兜底，全品种)：A50期指等腾讯不支持的品种
 ├── fetch_realtime_quote(tc)   # 腾讯实时行情：盘中高精度当天价/涨跌幅，取不到返回None降级
 ├── fetch_market_amounts()     # 腾讯newfqkline：三只指数60日成交额相加，启动拉一次
 ├── fetch_market_amount_today()# 腾讯实时：三只指数当日成交额之和，跟随刷新间隔
-├── fetch_kline_daily(code,start,end,count)  # 回测用日K：区间/最近N天，返回(name,[(日期,收盘)])升序
-│   ├── _fetch_kline_daily_tencent()   # 腾讯fqkline，前复权，区间按跨度放大count（封顶2000）
+├── fetch_kline_daily(code,start,end,count)  # 回测用日K：区间/最近N天，返回(name,[(日期,收盘)])升序；腾讯异常自动降级东财
+│   ├── _fetch_kline_daily_tencent()   # 腾讯newfqkline，前复权，区间按跨度放大count（封顶2000）
 │   └── _fetch_kline_daily_eastmoney() # 东财push2his兜底，beg/end精确区间
-├── run_backtest(...)          # 多条件均线回测引擎：交易明细+汇总+统计+买入持有对照
-│   ├── _cond_met()            # 单条件判定（站上/跌破X日线、冷却N天）
+├── run_backtest(...)          # 多条件回测引擎：买入=(「且」组全满足)或(任一「或」条件)；交易明细+汇总+统计+买入持有对照
+│   ├── _cond_met()            # 单条件判定（站上/跌破X日线、冷却N天、MACD金叉/死叉、突破上次卖点）
+│   ├── _macd(closes)          # 计算 DIF/DEA（EMA12/26 + DEA9）
+│   ├── conds_desc()           # 条件列表→中文描述（「且」连、「或」分支）
 │   └── _resolve_backtest_window()  # 从序列切出回测窗口起点
 ├── FloatWidget                # 置顶浮窗，支持任意数量股票，每行：价格  涨跌幅
 │   ├── _rebuild_rows()        # 增删股票时重建所有行（Label 透传鼠标事件，整体可拖）
@@ -209,12 +219,14 @@ stock_monitor.py
 ├── FetchWorker(QThread)       # 后台线程，依次拉股票数据，signal 传给主线程
 ├── IndexHistoryWorker(QThread)# 后台线程，启动拉60日历史成交额
 ├── IndexTodayWorker(QThread)  # 后台线程，跟随刷新间隔拉当日成交额
-├── BacktestWorker(QThread)    # 后台线程：拉日K+跑回测，signal 回主线程（注意勿用start等属性名遮蔽QThread方法）
+├── BacktestWorker(QThread)    # 后台线程：拉日K+跑回测，signal 回主线程（按时间段命中 _backtest_kline_cache 则复用不联网；注意勿用start等属性名遮蔽QThread方法）
 ├── NameLookupWorker(QThread)  # 后台线程：查股票名回填代码单元格
+├── _ConditionsCell           # 可增删的多条件单元格：买入侧分「且/或」两组，卖出侧单组
 ├── AnalysisWindow             # 股票分析窗口：多行策略回测，各行配置自动持久化
 │   ├── _add_row()/_del_row()  # 增删行；_save_rows/_schedule_save 防抖落盘 config.analysis_rows
-│   └── _run_row()             # 校验后起 BacktestWorker → BacktestResultDialog 展示
-├── BacktestResultDialog       # 回测结果弹窗：汇总+统计+买入持有对照+交易明细表
+│   └── _run_row()             # 校验后起 BacktestWorker → 结果回 _on_result 直接开 KLineDialog
+├── KLineChartWidget           # K线折线（QPainter手绘）：收盘价走势+买卖点红/绿标+悬停显示单点信息
+├── KLineDialog                # 回测结果窗口：汇总+统计+买入持有对照+K线折线+交易明细表
 └── MainWindow                 # 主窗口
     ├── _build_tray()          # 系统托盘图标+右键菜单
     ├── changeEvent()          # 最小化 → hide()，浮窗不受影响
@@ -236,9 +248,9 @@ stock_monitor.py
 | 用途 | 接口 | 备注 |
 |---|---|---|
 | 代码搜索/secid | `searchapi.eastmoney.com/api/suggest/get` | 东方财富，支持任意代码格式 |
-| 历史K线（主） | `web.ifzq.gtimg.cn/appstock/app/fqkline/get` | 腾讯，前复权日K，拉 80 日，风控松 |
+| 历史K线（主） | `web.ifzq.gtimg.cn/appstock/app/newfqkline/get` | 腾讯，前复权日K，拉 80 日，风控松（原 `fqkline` 路径间歇性 HTTP 501，已改用稳定的 `newfqkline`，字段一致） |
 | 历史K线（兜底） | `push2his.eastmoney.com/api/qt/stock/kline/get` | 东方财富，secid 直查，覆盖 A50 期指等腾讯不支持的品种 |
-| 回测历史K线 | 同上两个 fqkline / push2his | 前复权，一次请求返回整段：最近N天用 count，起止日期用区间参数（腾讯按跨度放大 count 封顶 2000，东财用 beg/end） |
+| 回测历史K线 | 同上 newfqkline / push2his | 前复权，一次请求返回整段：最近N天用 count，起止日期用区间参数（腾讯按跨度放大 count 封顶 2000，东财用 beg/end）；腾讯任何异常（501/超时）自动降级东财 |
 | 实时行情（盘中高精度价/量比） | `qt.gtimg.cn/q={前缀+代码}` | 腾讯，f[3]=价格 f[32]=涨跌幅 f[38]=换手率 f[49]=量比 |
 | 成交额历史（指数） | `web.ifzq.gtimg.cn/appstock/app/newfqkline/get` | 腾讯，带成交额字段（索引8，万元），拉 60 日，不限流 |
 | 成交额当日（指数） | `qt.gtimg.cn/q={前缀+代码}` | 腾讯实时，字段37为当日成交额（万元） |
@@ -287,7 +299,7 @@ stock_monitor.py
 ```
 
 > `t_strategy`：股票代码 → 我的做T策略下拉框索引（0 空 / 1 强势 / 2 震荡 / 3 弱势）。
-> `analysis_rows`：股票分析窗口各行配置。`mode` 为 `days`（用 `days`）或 `range`（用 `start`/`end`）；`buy`/`sell` 为条件列表，`type` ∈ `ma_above`/`ma_below`/`cooldown`，`param` 为日线周期或冷却天数。
+> `analysis_rows`：股票分析窗口各行配置。`mode` 为 `days`（用 `days`）或 `range`（用 `start`/`end`）；`buy`/`sell` 为条件列表，`type` ∈ 买入 `ma_above`/`cooldown`/`macd_golden`/`breakout_last_sell`、卖出 `ma_below`/`macd_death`，`param` 为日线周期或冷却天数（MACD/突破类无参数，param 忽略）。
 
 ---
 
@@ -306,4 +318,8 @@ python -m PyInstaller stock_monitor.spec --noconfirm
 
 **成本价/盈亏**：config 里加 `cost_prices: {"600519": 1600}`，`_on_result()` 里加"盈亏%"列
 
-**K线图**：双击行弹窗，用 `matplotlib` 绘制 `closes` 历史走势
+**手续费/滑点**：`run_backtest()` 里对买卖价按比例扣费，汇总改为净收益口径
+
+**更多回测指标**：夏普比率、年化收益、连续盈亏次数等，在 `run_backtest()` 的 stats 里扩展
+
+> 注：K线走势图已实现（`KLineChartWidget`，QPainter 手绘收盘价折线+买卖点，非 matplotlib，保持 exe 体积精简）。

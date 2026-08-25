@@ -50,10 +50,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QSpinBox, QMenu, QSystemTrayIcon, QColorDialog,
-    QComboBox, QStackedWidget, QDateEdit, QDialog
+    QComboBox, QStackedWidget, QDateEdit, QDialog, QFrame
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint, QEvent, QDate
-from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap, QPainter, QPen, QPolygon, QBrush
+from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap, QPainter, QPen, QBrush
 
 # 打包后用 exe 所在目录，开发时用脚本所在目录
 if getattr(sys, 'frozen', False):
@@ -77,6 +77,10 @@ def save_config(config):
 
 # 进程级缓存，避免每次刷新都重复搜索 secid
 _secid_cache = {}   # code → (secid, name)
+
+# 回测日K缓存：key=(mode, code, 时间段参数, 当天日期) → (name, series)。
+# 同一时间段重复点「确定」（只改买卖条件）直接复用，不再联网；换时间段或隔天才重取。
+_backtest_kline_cache = {}
 
 # "我的做T策略"下拉选项：(显示文本, 字体颜色)，索引即持久化到 config 的值
 T_STRATEGY_OPTIONS = [
@@ -157,29 +161,35 @@ def _fetch_kline_tencent(tc):
     境外期指(如 A50)不覆盖，返回 None 由调用方转东财兜底。
     K线格式(数组): [日期, 开, 收, 高, 低, 成交量, ...]，收盘索引2，成交量索引5
     """
+    # 用 newfqkline 而非 fqkline：后者路径时好时坏（间歇性 HTTP 501），
+    # newfqkline 稳定返回且字段一致（日期idx0/收盘idx2/量idx5）。
+    # 整体 try/except 兜底：任何异常（501/超时/断连）都返回 None，让调用方降级东财。
     url = (
-        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        f"https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get"
         f"?_var=kline_day&param={tc},day,,,80,qfq"
     )
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Referer": "https://gu.qq.com/",
     })
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        raw = resp.read().decode("utf-8")
-    data = json.loads(raw[raw.index("=") + 1:])
-    sd = (data.get("data") or {}).get(tc, {})
-    klines = sd.get("day") or sd.get("qfqday") or []
-    if not klines:
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+        data = json.loads(raw[raw.index("=") + 1:])
+        sd = (data.get("data") or {}).get(tc, {})
+        klines = sd.get("qfqday") or sd.get("day") or []
+        if not klines:
+            return None
+        closes = [float(k[2]) for k in klines]
+        volumes = []
+        for k in klines:
+            try:
+                volumes.append(float(k[5]))
+            except (IndexError, ValueError, TypeError):
+                volumes.append(0.0)
+        return closes, volumes
+    except Exception:
         return None
-    closes = [float(k[2]) for k in klines]
-    volumes = []
-    for k in klines:
-        try:
-            volumes.append(float(k[5]))
-        except (IndexError, ValueError, TypeError):
-            volumes.append(0.0)
-    return closes, volumes
 
 
 def _fetch_kline_eastmoney(secid):
@@ -339,7 +349,8 @@ def _fetch_kline_daily_tencent(tc, start="", end="", count=320):
     留空传 count 拉最近 count 天。K线数组 [日期, 开, 收, 高, 低, 成交量, ...]。
     """
     param = f"{tc},day,{start},{end},{count},qfq"
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?_var=k&param={param}"
+    # newfqkline 而非 fqkline：后者路径间歇 501，newfqkline 稳定且字段一致
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get?_var=k&param={param}"
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Referer": "https://gu.qq.com/",
@@ -416,7 +427,10 @@ def fetch_kline_daily(code, start="", end="", count=320):
         except ValueError:
             span_days = count
         count = min(MAX_KLINE_COUNT, max(count, span_days + 30))
-    series = _fetch_kline_daily_tencent(tc, start, end, count)
+    try:
+        series = _fetch_kline_daily_tencent(tc, start, end, count)
+    except Exception:
+        series = None    # 腾讯异常（501/超时）时降级东财，而非整体失败
     if series is None:
         series = _fetch_kline_daily_eastmoney(secid, start, end, count)
     if series is None:
@@ -426,15 +440,19 @@ def fetch_kline_daily(code, start="", end="", count=320):
 
 # 条件类型：type → (归属, 显示模板)。param 为条件参数（日线周期 / 天数）
 COND_TYPES = {
-    "ma_above":    ("buy",  "站上{p}日线"),        # 收盘 > MA(param)
-    "cooldown":    ("buy",  "距上次卖出>{p}天"),    # 距上次卖出超过 param 个交易日
-    "macd_golden": ("buy",  "MACD金叉"),           # DIF 上穿 DEA（12/26/9，param 无意义）
-    "ma_below":    ("sell", "跌破{p}日线"),         # 收盘 < MA(param)
-    "macd_death":  ("sell", "MACD死叉"),           # DIF 下穿 DEA（12/26/9，param 无意义）
+    "ma_above":           ("buy",  "站上{p}日线"),      # 收盘 > MA(param)
+    "cooldown":           ("buy",  "距上次卖出>{p}天"),  # 距上次卖出超过 param 个交易日
+    "macd_golden":        ("buy",  "MACD金叉"),         # DIF 上穿 DEA（12/26/9，param 无意义）
+    "breakout_last_sell": ("buy",  "突破上次卖点"),      # 收盘 > 上一次卖出价（OR 分支）
+    "ma_below":           ("sell", "跌破{p}日线"),       # 收盘 < MA(param)
+    "macd_death":         ("sell", "MACD死叉"),         # DIF 下穿 DEA（12/26/9，param 无意义）
 }
 
 # 无参数条件：这些类型的 param 数字框无意义，UI 置灰、回测忽略其值
-PARAMLESS_TYPES = {"macd_golden", "macd_death"}
+PARAMLESS_TYPES = {"macd_golden", "macd_death", "breakout_last_sell"}
+
+# OR 分支条件：买入侧这些条件与常规 AND 条件组「并列取或」——(AND组) 或 (任一OR条件)
+OR_TYPES = {"breakout_last_sell"}
 
 
 def _macd(closes, fast=12, slow=26, signal=9):
@@ -460,9 +478,10 @@ def _macd(closes, fast=12, slow=26, signal=9):
     return dif, dea
 
 
-def _cond_met(cond, closes, i, last_sell_idx, macd=None):
+def _cond_met(cond, closes, i, last_sell_idx, macd=None, last_sell_price=None):
     """单个条件在第 i 根K线是否成立。
     macd 为 (dif, dea) 预算结果，仅 MACD 类条件需要（由 run_backtest 传入）。
+    last_sell_price 为上一次卖出价，仅"突破上次卖点"需要。
     """
     t, p = cond["type"], cond["param"]
     if t == "ma_above":
@@ -484,16 +503,25 @@ def _cond_met(cond, closes, i, last_sell_idx, macd=None):
         if t == "macd_golden":               # DIF 上穿 DEA
             return dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]
         return dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]   # 下穿
+    if t == "breakout_last_sell":
+        if last_sell_price is None:          # 从未卖出过 → 无“上次卖点”可突破
+            return False
+        return closes[i] > last_sell_price
     return False
 
 
 def conds_desc(conds):
-    """把条件列表拼成中文描述，如 '站上5日线 且 距上次卖出>3天'。"""
-    parts = []
-    for c in conds:
-        tpl = COND_TYPES.get(c["type"], (None, "?"))[1]
-        parts.append(tpl.format(p=c["param"]))
-    return " 且 ".join(parts) if parts else "（无条件）"
+    """把条件列表拼成中文描述。常规条件用「且」连；OR 分支（如突破上次卖点）
+    与常规组「或」连，如 '(站上5日线 且 距上次卖出>3天) 或 突破上次卖点'。
+    """
+    def _fmt(c):
+        return COND_TYPES.get(c["type"], (None, "?"))[1].format(p=c["param"])
+
+    reg_txt = " 且 ".join(_fmt(c) for c in conds if c["type"] not in OR_TYPES)
+    or_txt = " 或 ".join(_fmt(c) for c in conds if c["type"] in OR_TYPES)
+    if reg_txt and or_txt:
+        return f"({reg_txt}) 或 {or_txt}"
+    return reg_txt or or_txt or "（无条件）"
 
 
 def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
@@ -514,6 +542,7 @@ def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
     wins = 0
     round_trips = 0
     last_sell_idx = None      # 上次卖出的K线索引（冷却条件用）
+    last_sell_price = None    # 上次卖出价（"突破上次卖点"条件用）
     equity_curve = []         # 逐日盯市权益（相对本金的浮动，用于最大回撤）
 
     # MACD 只在有 MACD 类条件时预算一次（DIF/DEA），避免逐根重算
@@ -529,13 +558,21 @@ def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
         equity_curve.append(realized + floating)
 
         if not holding:
-            if buy_conds and all(_cond_met(c, closes, i, last_sell_idx, macd) for c in buy_conds):
+            # 买入 = (常规 AND 条件组全成立) 或 (任一 OR 分支条件成立，如突破上次卖点)
+            regular = [c for c in buy_conds if c["type"] not in OR_TYPES]
+            or_conds = [c for c in buy_conds if c["type"] in OR_TYPES]
+            reg_ok = bool(regular) and all(
+                _cond_met(c, closes, i, last_sell_idx, macd, last_sell_price) for c in regular)
+            or_ok = any(
+                _cond_met(c, closes, i, last_sell_idx, macd, last_sell_price) for c in or_conds)
+            if reg_ok or or_ok:
                 holding = True
                 buy_price = price
                 trades.append({"date": dates[i], "side": "买入", "price": price,
                                "shares": shares, "pnl": None})
         else:
-            if sell_conds and all(_cond_met(c, closes, i, last_sell_idx, macd) for c in sell_conds):
+            if sell_conds and all(
+                    _cond_met(c, closes, i, last_sell_idx, macd, last_sell_price) for c in sell_conds):
                 pnl = (price - buy_price) * shares
                 realized += pnl
                 round_trips += 1
@@ -543,6 +580,7 @@ def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
                     wins += 1
                 holding = False
                 last_sell_idx = i
+                last_sell_price = price
                 trades.append({"date": dates[i], "side": "卖出", "price": price,
                                "shares": shares, "pnl": pnl})
 
@@ -715,16 +753,21 @@ class KLineChartWidget(QWidget):
     """回测收盘价折线 + 买卖点标注（QPainter 手绘）。
     series : [[date, close], ...] 升序（回测区间）
     trades : [{date, side, price, pnl}, ...]，side ∈ {'买入','卖出'}
-    买点红色 ▲ 标日期；卖点绿色 ▼ 标日期 + 单笔盈亏。
+    买点红点、卖点绿点直接画在折线上；鼠标悬停到某点时，在右上角固定位置
+    显示该点的方向/日期/价格/单笔盈亏。
     """
 
     RED, GREEN, LINE, AXIS, TEXT = "#e74c3c", "#27ae60", "#2980b9", "#cccccc", "#555555"
+    HIT_RADIUS = 8            # 鼠标距圆点多少像素内算命中
 
     def __init__(self, series, trades):
         super().__init__()
         self._series = series or []
         self._trades = trades or []
+        self._hits = []       # 上次绘制时记录的 [(x, y, trade), ...]，供命中检测
+        self._hover = None    # 当前悬停的 trade（None 表示无）
         self.setMinimumSize(680, 400)
+        self.setMouseTracking(True)   # 不按键也接收 mouseMoveEvent
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -792,61 +835,177 @@ class KLineChartWidget(QWidget):
                 painter.drawLine(prev, cur)
             prev = cur
 
-        # ── 买卖点标注 ──
+        # ── 买卖点：折线上画实心圆点（买红卖绿），并记录屏幕坐标供悬停命中 ──
         idx_of = {d: i for i, d in enumerate(dates)}
         sf = QFont(); sf.setPointSize(8)
+        hits = []
         for t in self._trades:
             i = idx_of.get(t["date"])
             if i is None:
                 continue
             x, y = int(px(i)), int(py(float(t["price"])))
-            is_buy = t["side"] == "买入"
-            color = QColor(self.RED if is_buy else self.GREEN)
+            color = QColor(self.RED if t["side"] == "买入" else self.GREEN)
             painter.setPen(QPen(color, 1))
             painter.setBrush(QBrush(color))
-            painter.setFont(sf)
-            if is_buy:                          # 点下方向上三角 ▲，下方标日期
-                tip = QPolygon([QPoint(x, y + 6), QPoint(x - 5, y + 15), QPoint(x + 5, y + 15)])
-                painter.drawPolygon(tip)
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(color)
-                painter.drawText(x - 30, y + 17, 60, 13,
-                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                                 t["date"][5:])
-            else:                               # 点上方向下三角 ▼，上方标日期 + 单笔盈亏
-                tip = QPolygon([QPoint(x, y - 6), QPoint(x - 5, y - 15), QPoint(x + 5, y - 15)])
-                painter.drawPolygon(tip)
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(color)                       # 日期用卖点绿色
-                painter.drawText(x - 30, y - 41, 60, 13,
-                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
-                                 t["date"][5:])
-                pnl = t.get("pnl")
-                if pnl is not None:                          # 盈亏：正红 负绿 零灰
-                    pnl_color = self.RED if pnl > 0 else (self.GREEN if pnl < 0 else "#888888")
-                    painter.setPen(QColor(pnl_color))
-                    painter.drawText(x - 30, y - 28, 60, 13,
-                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
-                                     f"{pnl:+,.0f}")
+            painter.drawEllipse(QPoint(x, y), 4, 4)
+            hits.append((x, y, t))
+        self._hits = hits
 
         # ── 图例 ──
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setFont(sf)
         painter.setPen(QColor(self.RED))
-        painter.drawText(left, 18, 90, 14, Qt.AlignmentFlag.AlignLeft, "▲ 买入")
+        painter.drawText(left, 18, 90, 14, Qt.AlignmentFlag.AlignLeft, "● 买入")
         painter.setPen(QColor(self.GREEN))
-        painter.drawText(left + 60, 18, 120, 14, Qt.AlignmentFlag.AlignLeft, "▼ 卖出(标盈亏)")
+        painter.drawText(left + 60, 18, 120, 14, Qt.AlignmentFlag.AlignLeft, "● 卖出")
+        painter.setPen(QColor("#999999"))
+        painter.drawText(left + 130, 18, 200, 14, Qt.AlignmentFlag.AlignLeft, "（鼠标移到点上看详情）")
+
+        # ── 悬停信息框：固定在右上角 ──
+        if self._hover is not None:
+            self._draw_hover_box(painter, w, right, top)
         painter.end()
+
+    def _draw_hover_box(self, painter, w, right, top):
+        """在图右上角画一个信息框，显示当前悬停买卖点的方向/日期/价格/盈亏。"""
+        t = self._hover
+        is_buy = t["side"] == "买入"
+        side_color = self.RED if is_buy else self.GREEN
+        lines = [
+            (t["side"], side_color),
+            (f"日期 {t['date']}", self.TEXT),
+            (f"价格 {float(t['price']):.4f}", self.TEXT),
+        ]
+        pnl = t.get("pnl")
+        if pnl is not None:
+            pnl_color = self.RED if pnl > 0 else (self.GREEN if pnl < 0 else "#888888")
+            lines.append((f"盈亏 {pnl:+,.2f}", pnl_color))
+
+        bf = QFont(); bf.setPointSize(9)
+        painter.setFont(bf)
+        box_w, line_h, pad = 150, 18, 8
+        box_h = pad * 2 + line_h * len(lines)
+        bx = w - right - box_w
+        by = top + 4
+        painter.setPen(QPen(QColor("#cccccc"), 1))
+        painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+        painter.drawRoundedRect(bx, by, box_w, box_h, 6, 6)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for k, (text, color) in enumerate(lines):
+            painter.setPen(QColor(color))
+            painter.drawText(bx + pad, by + pad + k * line_h, box_w - pad * 2, line_h,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+
+    def mouseMoveEvent(self, event):
+        """找离光标最近、且在 HIT_RADIUS 内的买卖点，作为悬停项。"""
+        pos = event.position()
+        mx, my = pos.x(), pos.y()
+        best, best_d2 = None, self.HIT_RADIUS ** 2
+        for x, y, t in self._hits:
+            d2 = (mx - x) ** 2 + (my - y) ** 2
+            if d2 <= best_d2:
+                best, best_d2 = t, d2
+        if best is not self._hover:
+            self._hover = best
+            self.update()
+
+    def leaveEvent(self, event):
+        if self._hover is not None:
+            self._hover = None
+            self.update()
 
 
 class KLineDialog(QDialog):
-    """K线买卖点弹窗：内嵌 KLineChartWidget + 关闭按钮。"""
+    """K线买卖点弹窗：顶部回测汇总信息 + 中间 K线折线(标买卖点) + 底部交易明细表。"""
 
-    def __init__(self, code, name, series, trades, parent=None):
+    def __init__(self, code, name, report, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"K线买卖点 · {name}({code})")
-        self.resize(780, 480)
+        self.resize(820, 680)
         lay = QVBoxLayout(self)
-        lay.addWidget(KLineChartWidget(series, trades))
+
+        s = report["summary"]
+        st = report["stats"]
+        win = report.get("window", {})
+        red, green, gray = "#e74c3c", "#27ae60", "#888888"
+
+        # ── 汇总 ──
+        pnl_color = red if s["total_pnl"] > 0 else (green if s["total_pnl"] < 0 else gray)
+        summary = QLabel(
+            f"<b>区间</b>：{win.get('first', '?')} ~ {win.get('last', '?')}　"
+            f"<b>买入</b>：{st['buy_desc']}　<b>卖出</b>：{st['sell_desc']}　(10000股/笔)<br>"
+            f"<b>总盈亏</b>：<span style='color:{pnl_color}'>{s['total_pnl']:+,.2f} 元</span>　"
+            f"<b>收益率</b>：<span style='color:{pnl_color}'>{s['return_pct']:+.2f}%</span>　"
+            f"<b>本金(首次买入)</b>：{s['principal']:,.2f} 元　"
+            f"<b>期末资产</b>：{s['final_equity']:,.2f} 元"
+        )
+        summary.setTextFormat(Qt.TextFormat.RichText)
+        summary.setWordWrap(True)
+        lay.addWidget(summary)
+
+        # ── 统计指标 ──
+        hold_txt = "是（未平仓）" if st["holding"] else "否"
+        stats = QLabel(
+            f"交易次数(完整来回)：{st['trade_count']}　"
+            f"胜率：{st['win_rate']:.1f}%　"
+            f"最大回撤：{st['max_drawdown']:,.2f} 元　"
+            f"期末持仓：{hold_txt}"
+        )
+        stats.setStyleSheet("color:#555; font-size:12px;")
+        lay.addWidget(stats)
+
+        # ── 买入并持有对照 ──
+        bh = report.get("buy_hold", {"has_buy": False})
+        if bh["has_buy"]:
+            bh_color = red if bh["pnl"] > 0 else (green if bh["pnl"] < 0 else gray)
+            diff = s["return_pct"] - bh["return_pct"]          # 策略收益率 − 持有收益率
+            diff_color = red if diff > 0 else (green if diff < 0 else gray)
+            diff_txt = "策略跑赢" if diff > 0 else ("策略跑输" if diff < 0 else "打平")
+            buyhold = QLabel(
+                f"<b>买入并持有对照</b>（首个买点 {bh['buy_date']}@{bh['buy_price']:.4f} → 期末，不执行卖出）　"
+                f"总盈亏：<span style='color:{bh_color}'>{bh['pnl']:+,.2f} 元</span>　"
+                f"收益率：<span style='color:{bh_color}'>{bh['return_pct']:+.2f}%</span>　"
+                f"<span style='color:{diff_color}'>{diff_txt} {abs(diff):.2f}%</span>"
+            )
+        else:
+            buyhold = QLabel("<b>买入并持有对照</b>：该区间未触发买入信号，无对照。")
+        buyhold.setTextFormat(Qt.TextFormat.RichText)
+        buyhold.setWordWrap(True)
+        buyhold.setStyleSheet("font-size:12px;")
+        lay.addWidget(buyhold)
+
+        # ── K线折线（标买卖点，主区域）──
+        trades = report["trades"]
+        series = report.get("series", [])
+        lay.addWidget(KLineChartWidget(series, trades), stretch=1)
+
+        # ── 交易明细表 ──
+        tbl = QTableWidget()
+        tbl.setColumnCount(5)
+        tbl.setHorizontalHeaderLabels(["日期", "方向", "价格", "股数", "单笔盈亏"])
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.setMaximumHeight(160)
+        tbl.setRowCount(len(trades))
+        for r, t in enumerate(trades):
+            side_color = red if t["side"] == "买入" else green
+            cells = [
+                (t["date"], None),
+                (t["side"], QColor(side_color)),
+                (f"{t['price']:.4f}", None),
+                (f"{t['shares']:,}", None),
+                ("--" if t["pnl"] is None else f"{t['pnl']:+,.2f}",
+                 None if t["pnl"] is None else QColor(red if t["pnl"] > 0 else green)),
+            ]
+            for c, (text, fg) in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if fg:
+                    item.setForeground(fg)
+                tbl.setItem(r, c, item)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(tbl)
+        if not trades:
+            lay.addWidget(QLabel("该区间内没有触发任何买卖信号。"))
+
         btn = QPushButton("关闭")
         btn.clicked.connect(self.accept)
         lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
@@ -1101,11 +1260,25 @@ class BacktestWorker(QThread):
                    for c in self.buy_conds + self.sell_conds):
                 ma_params.append(34)
             pad = (max(ma_params) if ma_params else 5) * 2 + 20
+
+            # 缓存 key 只认「时间段」（与买卖条件无关）：同一时间段重复点确定直接复用上次数据、
+            # 不再联网；只有时间段变化（或隔天数据可能更新）才重新请求。
+            today = time.strftime("%Y-%m-%d")
             if self.mode == "range":
-                sd = datetime.datetime.strptime(self.start_date, "%Y-%m-%d") - datetime.timedelta(days=pad * 2)
-                name, series = fetch_kline_daily(self.code, sd.strftime("%Y-%m-%d"), self.end_date)
+                cache_key = ("range", self.code, self.start_date, self.end_date, today)
             else:
-                name, series = fetch_kline_daily(self.code, count=self.days + pad)
+                cache_key = ("days", self.code, self.days, today)
+
+            cached = _backtest_kline_cache.get(cache_key)
+            if cached is not None:
+                name, series = cached
+            else:
+                if self.mode == "range":
+                    sd = datetime.datetime.strptime(self.start_date, "%Y-%m-%d") - datetime.timedelta(days=pad * 2)
+                    name, series = fetch_kline_daily(self.code, sd.strftime("%Y-%m-%d"), self.end_date)
+                else:
+                    name, series = fetch_kline_daily(self.code, count=self.days + pad)
+                _backtest_kline_cache[cache_key] = (name, series)
             dates, closes, start_idx = _resolve_backtest_window(series, self.mode, self.days, self.start_date)
             report = run_backtest(dates, closes, self.buy_conds, self.sell_conds, start_idx)
             report["window"] = {"first": dates[start_idx], "last": dates[-1]}
@@ -1246,40 +1419,71 @@ class _ConditionsCell(QWidget):
     def __init__(self, kind="buy", conds=None):
         super().__init__()
         self.kind = kind
-        # 该 kind 可选的条件类型：[(type, 显示名), ...]
-        self._types = [(t, COND_TYPES[t][1].replace("{p}", "X"))
-                       for t, (owner, _tpl) in COND_TYPES.items() if owner == kind]
+        # 该 kind 可选的条件类型按「且/或」分组：[(type, 显示名), ...]
+        all_types = [(t, COND_TYPES[t][1].replace("{p}", "X"))
+                     for t, (owner, _tpl) in COND_TYPES.items() if owner == kind]
+        self._and_types = [x for x in all_types if x[0] not in OR_TYPES]
+        self._or_types = [x for x in all_types if x[0] in OR_TYPES]
+        self._has_or = bool(self._or_types)   # 买入侧才有 OR 分组；卖出侧退化为单组
 
         self._outer = QVBoxLayout(self)
         self._outer.setContentsMargins(2, 2, 2, 2)
         self._outer.setSpacing(2)
-        self._rows_box = QVBoxLayout()
-        self._rows_box.setSpacing(2)
-        self._outer.addLayout(self._rows_box)
 
-        add_btn = QPushButton("＋ 添加条件")
-        add_btn.setFixedHeight(22)
-        add_btn.clicked.connect(lambda: self._add_condition())
-        self._outer.addWidget(add_btn)
+        self._rows = []   # [(row_widget, type_combo, param_spin, group)] group∈{'and','or'}
 
-        self._rows = []   # [(row_widget, type_combo, param_spin)]
-        if conds:                       # 从配置回填已保存的条件
+        # ── 「且」分组 ──
+        if self._has_or:
+            self._outer.addWidget(self._group_label("且（全部满足）"))
+        self._and_box = QVBoxLayout()
+        self._and_box.setSpacing(2)
+        self._outer.addLayout(self._and_box)
+        add_and = QPushButton("＋ 添加“且”条件" if self._has_or else "＋ 添加条件")
+        add_and.setFixedHeight(22)
+        add_and.clicked.connect(lambda: self._add_condition("and"))
+        self._outer.addWidget(add_and)
+
+        # ── 「或」分组（仅买入侧）──
+        if self._has_or:
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setStyleSheet("color:#ccc;")
+            self._outer.addWidget(line)
+            self._outer.addWidget(self._group_label("或（满足即买）"))
+            self._or_box = QVBoxLayout()
+            self._or_box.setSpacing(2)
+            self._outer.addLayout(self._or_box)
+            add_or = QPushButton("＋ 添加“或”条件")
+            add_or.setFixedHeight(22)
+            add_or.clicked.connect(lambda: self._add_condition("or"))
+            self._outer.addWidget(add_or)
+
+        if conds:                       # 从配置回填：按类型归入对应分组
             for c in conds:
-                self._add_condition(default_type=c.get("type"), param=c.get("param"))
-        else:                           # 默认给一条条件
-            self._add_condition(default_type=self._types[0][0])
+                g = "or" if c.get("type") in OR_TYPES else "and"
+                self._add_condition(g, default_type=c.get("type"), param=c.get("param"))
+        else:                           # 默认给一条「且」条件
+            self._add_condition("and", default_type=self._and_types[0][0])
 
-    def _add_condition(self, default_type=None, param=None):
+    def _group_label(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color:#666; font-size:11px;")
+        return lbl
+
+    def _add_condition(self, group="and", default_type=None, param=None):
+        types = self._or_types if group == "or" else self._and_types
+        if not types:                   # 卖出侧无 OR 类型时的保护
+            return
         row = QWidget()
         rl = QHBoxLayout(row)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(3)
 
         combo = QComboBox()
-        for _t, label in self._types:
+        for _t, label in types:
             combo.addItem(label)
         if default_type:
-            idx = next((i for i, (t, _l) in enumerate(self._types) if t == default_type), 0)
+            idx = next((i for i, (t, _l) in enumerate(types) if t == default_type), 0)
             combo.setCurrentIndex(idx)
 
         spin = QSpinBox()
@@ -1287,9 +1491,9 @@ class _ConditionsCell(QWidget):
         spin.setValue(param if param is not None else (5 if self.kind == "buy" else 10))
         spin.setMinimumWidth(66)
 
-        # 无参数类型（MACD 金叉/死叉）：参数框置灰禁用，值无意义
+        # 无参数类型（MACD 金叉/死叉、突破上次卖点）：参数框置灰禁用，值无意义
         def _sync_spin():
-            ctype = self._types[combo.currentIndex()][0]
+            ctype = types[combo.currentIndex()][0]
             spin.setEnabled(ctype not in PARAMLESS_TYPES)
         _sync_spin()
 
@@ -1307,14 +1511,15 @@ class _ConditionsCell(QWidget):
         rl.addWidget(del_btn)
         rl.addStretch()
 
-        self._rows_box.addWidget(row)
-        self._rows.append((row, combo, spin))
+        box = self._or_box if group == "or" else self._and_box
+        box.addWidget(row)
+        self._rows.append((row, combo, spin, group))
         self._outer.activate()      # 立即重算布局，让 sizeHint 反映新增的条件行
         self.updateGeometry()
         self.conditions_changed.emit()
 
     def _del_condition(self, row):
-        for i, (w, _c, _s) in enumerate(self._rows):
+        for i, (w, _c, _s, _g) in enumerate(self._rows):
             if w is row:
                 self._rows.pop(i)
                 w.setParent(None)
@@ -1326,116 +1531,11 @@ class _ConditionsCell(QWidget):
 
     def value(self):
         out = []
-        for _w, combo, spin in self._rows:
-            ctype = self._types[combo.currentIndex()][0]
+        for _w, combo, spin, group in self._rows:
+            types = self._or_types if group == "or" else self._and_types
+            ctype = types[combo.currentIndex()][0]
             out.append({"type": ctype, "param": spin.value()})
         return out
-
-
-class BacktestResultDialog(QDialog):
-    """回测结果弹窗：汇总 + 交易明细表 + 统计指标。"""
-
-    def __init__(self, code, name, report, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"回测结果 · {name}({code})")
-        self.resize(560, 520)
-        lay = QVBoxLayout(self)
-
-        s = report["summary"]
-        st = report["stats"]
-        win = report.get("window", {})
-        red, green, gray = "#e74c3c", "#27ae60", "#888888"
-
-        # ── 汇总 ──
-        pnl_color = red if s["total_pnl"] > 0 else (green if s["total_pnl"] < 0 else gray)
-        summary = QLabel(
-            f"<b>区间</b>：{win.get('first', '?')} ~ {win.get('last', '?')}　"
-            f"<b>买入</b>：{st['buy_desc']}　<b>卖出</b>：{st['sell_desc']}　(10000股/笔)<br>"
-            f"<b>总盈亏</b>：<span style='color:{pnl_color}'>{s['total_pnl']:+,.2f} 元</span>　"
-            f"<b>收益率</b>：<span style='color:{pnl_color}'>{s['return_pct']:+.2f}%</span><br>"
-            f"<b>本金(首次买入)</b>：{s['principal']:,.2f} 元　"
-            f"<b>期末资产</b>：{s['final_equity']:,.2f} 元"
-        )
-        summary.setTextFormat(Qt.TextFormat.RichText)
-        summary.setWordWrap(True)
-        lay.addWidget(summary)
-
-        # ── 统计指标 ──
-        hold_txt = "是（未平仓）" if st["holding"] else "否"
-        stats = QLabel(
-            f"交易次数(完整来回)：{st['trade_count']}　"
-            f"胜率：{st['win_rate']:.1f}%　"
-            f"最大回撤：{st['max_drawdown']:,.2f} 元　"
-            f"期末持仓：{hold_txt}"
-        )
-        stats.setStyleSheet("color:#555; font-size:12px;")
-        lay.addWidget(stats)
-
-        # ── 买入并持有对照 ──
-        bh = report.get("buy_hold", {"has_buy": False})
-        if bh["has_buy"]:
-            bh_color = red if bh["pnl"] > 0 else (green if bh["pnl"] < 0 else gray)
-            diff = s["return_pct"] - bh["return_pct"]          # 策略收益率 − 持有收益率
-            diff_color = red if diff > 0 else (green if diff < 0 else gray)
-            diff_txt = "策略跑赢" if diff > 0 else ("策略跑输" if diff < 0 else "打平")
-            buyhold = QLabel(
-                f"<b>买入并持有对照</b>（首个买点 {bh['buy_date']}@{bh['buy_price']:.4f} → 期末，不执行卖出）<br>"
-                f"总盈亏：<span style='color:{bh_color}'>{bh['pnl']:+,.2f} 元</span>　"
-                f"收益率：<span style='color:{bh_color}'>{bh['return_pct']:+.2f}%</span>　"
-                f"<span style='color:{diff_color}'>{diff_txt} {abs(diff):.2f}%</span>"
-            )
-        else:
-            buyhold = QLabel("<b>买入并持有对照</b>：该区间未触发买入信号，无对照。")
-        buyhold.setTextFormat(Qt.TextFormat.RichText)
-        buyhold.setWordWrap(True)
-        buyhold.setStyleSheet("font-size:12px;")
-        lay.addWidget(buyhold)
-
-        # ── 交易明细表 ──
-        trades = report["trades"]
-        tbl = QTableWidget()
-        tbl.setColumnCount(5)
-        tbl.setHorizontalHeaderLabels(["日期", "方向", "价格", "股数", "单笔盈亏"])
-        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        tbl.setRowCount(len(trades))
-        for r, t in enumerate(trades):
-            side_color = red if t["side"] == "买入" else green
-            cells = [
-                (t["date"], None),
-                (t["side"], QColor(side_color)),
-                (f"{t['price']:.4f}", None),
-                (f"{t['shares']:,}", None),
-                ("--" if t["pnl"] is None else f"{t['pnl']:+,.2f}",
-                 None if t["pnl"] is None else QColor(red if t["pnl"] > 0 else green)),
-            ]
-            for c, (text, fg) in enumerate(cells):
-                item = QTableWidgetItem(text)
-                if fg:
-                    item.setForeground(fg)
-                tbl.setItem(r, c, item)
-        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        lay.addWidget(tbl)
-
-        if not trades:
-            lay.addWidget(QLabel("该区间内没有触发任何买卖信号。"))
-
-        # ── 底部按钮：查看K线买卖点 + 关闭 ──
-        self._code, self._name = code, name
-        self._series = report.get("series", [])
-        self._trades = trades
-        btn_row = QHBoxLayout()
-        kline_btn = QPushButton("查看K线买卖点")
-        kline_btn.setEnabled(len(self._series) >= 2)   # 无价格数据则不可点
-        kline_btn.clicked.connect(self._show_kline)
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(self.accept)
-        btn_row.addStretch()
-        btn_row.addWidget(kline_btn)
-        btn_row.addWidget(close_btn)
-        lay.addLayout(btn_row)
-
-    def _show_kline(self):
-        KLineDialog(self._code, self._name, self._series, self._trades, self).exec()
 
 
 class AnalysisWindow(QWidget):
@@ -1607,8 +1707,7 @@ class AnalysisWindow(QWidget):
         if cell is not None:
             cell.set_name(name)   # 回填股票名（编辑时若未触发查询也能补上）
         report = json.loads(report_json)
-        dlg = BacktestResultDialog(code, name, report, self)
-        dlg.exec()
+        KLineDialog(code, name, report, self).exec()   # 点确定直接开K线买卖点窗口（汇总信息已并入）
 
     def _on_error(self, row_id, code, msg):
         QMessageBox.warning(self, "回测失败", f"{code}: {msg}")
