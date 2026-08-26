@@ -918,8 +918,9 @@ class KLineChartWidget(QWidget):
 class KLineDialog(QDialog):
     """K线买卖点弹窗：顶部回测汇总信息 + 中间 K线折线(标买卖点) + 底部交易明细表。"""
 
-    def __init__(self, code, name, report, parent=None):
+    def __init__(self, code, name, report, parent=None, on_rank=None):
         super().__init__(parent)
+        self.on_rank = on_rank            # 「收益排行」按钮回调（无则不显示该按钮）
         self.setWindowTitle(f"K线买卖点 · {name}({code})")
         self.resize(820, 680)
         lay = QVBoxLayout(self)
@@ -1006,9 +1007,100 @@ class KLineDialog(QDialog):
         if not trades:
             lay.addWidget(QLabel("该区间内没有触发任何买卖信号。"))
 
+        # ── 底部按钮：收益排行 + 关闭 ──
+        btn_bar = QHBoxLayout()
+        if self.on_rank is not None:
+            btn_rank = QPushButton("收益排行")
+            btn_rank.clicked.connect(self.on_rank)
+            btn_bar.addWidget(btn_rank, alignment=Qt.AlignmentFlag.AlignLeft)
+        btn_bar.addStretch()
         btn = QPushButton("关闭")
-        btn.clicked.connect(self.accept)
-        lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
+        btn.clicked.connect(self.close)
+        btn_bar.addWidget(btn)
+        lay.addLayout(btn_bar)
+
+
+class RankDialog(QDialog):
+    """收益排行榜（非模态）：只列当前股票+当前时间段下各买卖条件组合的回测结果，
+    按收益率降序。点任意行发出 row_activated(条目索引)，由外部打开对应K线窗口。
+    """
+    row_activated = pyqtSignal(int)
+    scope_changed = pyqtSignal(str)     # 下拉切换股票/时间段作用域时发出 scope_key
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("收益排行")
+        self.resize(760, 440)
+        lay = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("股票 / 时间段："))
+        self.scope_box = QComboBox()
+        self.scope_box.setMinimumWidth(340)
+        self.scope_box.currentIndexChanged.connect(self._on_combo)
+        top.addWidget(self.scope_box)
+        top.addStretch()
+        lay.addLayout(top)
+
+        self.subtitle = QLabel("")
+        self.subtitle.setStyleSheet("color:#555; font-size:12px;")
+        self.subtitle.setWordWrap(True)
+        lay.addWidget(self.subtitle)
+
+        self.tbl = QTableWidget()
+        self.tbl.setColumnCount(6)
+        self.tbl.setHorizontalHeaderLabels(
+            ["排名", "买入策略", "卖出策略", "交易次数", "收益率%", "总盈亏"])
+        self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tbl.cellClicked.connect(lambda r, _c: self.row_activated.emit(r))
+        lay.addWidget(self.tbl)
+        lay.addWidget(QLabel("点击任意行可打开该组合的K线买卖点窗口（同时只保留一个K线窗口）。"))
+
+    def _on_combo(self, idx):
+        key = self.scope_box.itemData(idx)
+        if key is not None:
+            self.scope_changed.emit(key)
+
+    def set_scopes(self, items, current_key):
+        """items：[(scope_key, 显示标签)]；current_key：默认选中项。填充时屏蔽信号避免误触发。"""
+        self.scope_box.blockSignals(True)
+        self.scope_box.clear()
+        for key, label in items:
+            self.scope_box.addItem(label, key)
+        if current_key is not None:
+            i = self.scope_box.findData(current_key)
+            if i >= 0:
+                self.scope_box.setCurrentIndex(i)
+        self.scope_box.blockSignals(False)
+
+    def refresh(self, subtitle, entries):
+        """entries：已按收益率降序排好的条目列表。"""
+        self.subtitle.setText(subtitle)
+        red, green, gray = "#e74c3c", "#27ae60", "#888888"
+        self.tbl.setRowCount(len(entries))
+        for r, e in enumerate(entries):
+            ret, pnl = e["return_pct"], e["total_pnl"]
+            ret_c = red if ret > 0 else (green if ret < 0 else gray)
+            pnl_c = red if pnl > 0 else (green if pnl < 0 else gray)
+            cells = [
+                (str(r + 1), None),
+                (e["buy_desc"], None),
+                (e["sell_desc"], None),
+                (str(e["trade_count"]), None),
+                (f"{ret:+.2f}", QColor(ret_c)),
+                (f"{pnl:+,.2f}", QColor(pnl_c)),
+            ]
+            for c, (text, fg) in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if fg:
+                    item.setForeground(fg)
+                self.tbl.setItem(r, c, item)
+        h = self.tbl.horizontalHeader()
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for c in (0, 3, 4, 5):
+            h.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
 
 
 class FloatWidget(QWidget):
@@ -1284,6 +1376,9 @@ class BacktestWorker(QThread):
             report["window"] = {"first": dates[start_idx], "last": dates[-1]}
             # 回测区间的收盘序列，供 K线窗口画折线+标买卖点（不必再联网）
             report["series"] = [[dates[j], closes[j]] for j in range(start_idx, len(closes))]
+            # 时间段元信息：主线程据此判定「收益排行」榜单作用域（换股票/改时间段则清空）
+            report["meta"] = {"mode": self.mode, "days": self.days,
+                              "start": self.start_date, "end": self.end_date}
             self.result.emit(self.row_id, self.code, name, json.dumps(report))
         except Exception as e:
             self.error.emit(self.row_id, self.code, str(e))
@@ -1550,6 +1645,12 @@ class AnalysisWindow(QWidget):
         self._next_row_id = 0
         self._workers = {}       # row_id → BacktestWorker（持引用防 GC）
         self._code_cells = {}    # row_id → _CodeCell（回测返回后回填股票名）
+        # 收益排行：按作用域(股票+时间段)持久化到本地 config；每只/每时间段各存一张榜
+        self._rank_store = self.config.get("rank_store") or {}   # scope_key → {name, meta, entries}
+        self._rank_active_scope = self.config.get("rank_last_scope")  # 最近一次回测的作用域
+        self._rank_view_scope = self._rank_active_scope          # 排行榜当前查看的作用域
+        self._kline_win = None   # 唯一 K线窗口（非模态单例）
+        self._rank_win = None    # 唯一 收益排行窗口（非模态单例）
         self._save_timer = QTimer(self)      # 变更防抖：多次快速改动只落盘一次
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(400)
@@ -1601,6 +1702,10 @@ class AnalysisWindow(QWidget):
         time_cell.changed.connect(self._schedule_save)
         buy_cell.conditions_changed.connect(self._schedule_save)
         sell_cell.conditions_changed.connect(self._schedule_save)
+        # 记录该行当前作用域快照；股票/时间段变化时删掉旧作用域的排行（含本地）
+        time_cell._rank_scope = self._row_scope(code_cell, time_cell)
+        code_cell.changed.connect(lambda cc=code_cell, tc=time_cell: self._on_row_scope_maybe_changed(cc, tc))
+        time_cell.changed.connect(lambda cc=code_cell, tc=time_cell: self._on_row_scope_maybe_changed(cc, tc))
         self.table.setCellWidget(r, 2, buy_cell)
         self.table.setCellWidget(r, 3, sell_cell)
 
@@ -1610,11 +1715,15 @@ class AnalysisWindow(QWidget):
         ol.setSpacing(4)
         btn_run = QPushButton("确定")
         btn_run.setFixedWidth(56)
+        btn_rank = QPushButton("排行")
+        btn_rank.setFixedWidth(56)
         btn_del = QPushButton("删除")
         btn_del.setFixedWidth(56)
         btn_run.clicked.connect(lambda: self._run_row(op))
+        btn_rank.clicked.connect(self._open_leaderboard)
         btn_del.clicked.connect(lambda: self._del_row(op))
         ol.addWidget(btn_run)
+        ol.addWidget(btn_rank)
         ol.addWidget(btn_del)
         self.table.setCellWidget(r, 4, op)
         self.table.resizeRowsToContents()
@@ -1656,6 +1765,9 @@ class AnalysisWindow(QWidget):
     def _del_row(self, op_widget):
         r = self._widget_row(op_widget)
         if r >= 0:
+            scope = self._row_scope(self.table.cellWidget(r, 0), self.table.cellWidget(r, 1))
+            if scope:                        # 删整行股票 → 连带删掉它的排行（含本地）
+                self._delete_scope(scope)
             self.table.removeRow(r)
             self._schedule_save()
 
@@ -1707,10 +1819,147 @@ class AnalysisWindow(QWidget):
         if cell is not None:
             cell.set_name(name)   # 回填股票名（编辑时若未触发查询也能补上）
         report = json.loads(report_json)
-        KLineDialog(code, name, report, self).exec()   # 点确定直接开K线买卖点窗口（汇总信息已并入）
+        self._record_rank(code, name, report)          # 记入/更新收益排行
+        self._open_kline(code, name, report)           # 点确定直接开K线买卖点窗口（汇总信息已并入）
 
     def _on_error(self, row_id, code, msg):
         QMessageBox.warning(self, "回测失败", f"{code}: {msg}")
+
+    # ── 收益排行（按作用域持久化到本地）──
+    @staticmethod
+    def _scope_key(code, mode, days, start, end):
+        if mode == "range":
+            return f"{code}|range|{start}|{end}"
+        return f"{code}|days|{days}"
+
+    def _row_scope(self, code_cell, time_cell):
+        """由某行的代码+时间段算出作用域 key；代码为空返回 None。"""
+        code = code_cell.value()
+        if not code or len(code) < 2:
+            return None
+        mode, days, start, end = time_cell.value()
+        return self._scope_key(code, mode, days, start, end)
+
+    def _scope_label(self, key):
+        rec = self._rank_store.get(key, {})
+        meta = rec.get("meta", {})
+        code = meta.get("code", key.split("|")[0])
+        name = rec.get("name", "")
+        who = f"{name}({code})" if name else code
+        period = (f"{meta.get('start')} ~ {meta.get('end')}" if meta.get("mode") == "range"
+                  else f"最近{meta.get('days')}天")
+        return f"{who} · {period}"
+
+    def _save_rank(self):
+        self.config["rank_store"] = self._rank_store
+        self.config["rank_last_scope"] = self._rank_active_scope
+        save_config(self.config)
+
+    def _delete_scope(self, key):
+        """删除某作用域的排行并落盘；若正被查看/激活则回退到其它作用域。"""
+        if key not in self._rank_store:
+            return
+        del self._rank_store[key]
+        if self._rank_active_scope == key:
+            self._rank_active_scope = next(iter(self._rank_store), None)
+        if self._rank_view_scope == key:
+            self._rank_view_scope = self._rank_active_scope
+        self._save_rank()
+        if self._rank_win is not None and self._rank_win.isVisible():
+            self._populate_rank_scopes()
+
+    def _on_row_scope_maybe_changed(self, code_cell, time_cell):
+        """行的股票/时间段改变 → 旧作用域排行失效，从本地删除。"""
+        old = getattr(time_cell, "_rank_scope", None)
+        new = self._row_scope(code_cell, time_cell)
+        if not self._loading and old is not None and old != new:
+            self._delete_scope(old)
+        time_cell._rank_scope = new
+
+    def _record_rank(self, code, name, report):
+        """记入排行：作用域=(股票+时间段)；同一(买入,卖出)描述去重更新；按收益率降序；立即落盘。"""
+        m = report.get("meta", {})
+        key = self._scope_key(code, m.get("mode"), m.get("days"), m.get("start"), m.get("end"))
+        rec = self._rank_store.get(key)
+        if rec is None:
+            rec = {"name": name,
+                   "meta": {"code": code, "mode": m.get("mode"), "days": m.get("days"),
+                            "start": m.get("start"), "end": m.get("end")},
+                   "entries": []}
+            self._rank_store[key] = rec
+        rec["name"] = name
+        # 同一作用域下各条目的收盘价 series 完全相同，只在作用域级存一份，避免重复膨胀
+        rec["series"] = report.get("series", [])
+        stored = {k: v for k, v in report.items() if k != "series"}   # 条目 report 去掉 series
+        st, s = report["stats"], report["summary"]
+        ck = (st["buy_desc"], st["sell_desc"])
+        entries = [e for e in rec["entries"] if (e["buy_desc"], e["sell_desc"]) != ck]  # 去重
+        entries.append({
+            "buy_desc": st["buy_desc"], "sell_desc": st["sell_desc"],
+            "trade_count": st["trade_count"],
+            "return_pct": s["return_pct"], "total_pnl": s["total_pnl"],
+            "report": stored,
+        })
+        entries.sort(key=lambda e: e["return_pct"], reverse=True)
+        rec["entries"] = entries
+        self._rank_active_scope = key
+        self._rank_view_scope = key
+        self._save_rank()
+        if self._rank_win is not None and self._rank_win.isVisible():
+            self._populate_rank_scopes()
+
+    def _populate_rank_scopes(self):
+        """把本地所有作用域填进下拉，默认选中当前查看/激活的那个，并刷新表格。"""
+        items = [(k, self._scope_label(k)) for k in self._rank_store.keys()]
+        cur = self._rank_view_scope
+        if cur not in self._rank_store:
+            cur = (self._rank_active_scope if self._rank_active_scope in self._rank_store
+                   else (items[0][0] if items else None))
+        self._rank_win.set_scopes(items, cur)
+        self._show_rank_scope(cur)
+
+    def _show_rank_scope(self, key):
+        self._rank_view_scope = key
+        rec = self._rank_store.get(key)
+        if not rec:
+            self._rank_win.refresh("还没有排行记录。在某行点「确定」跑一次，收益就会进入排行。", [])
+            return
+        entries, meta = rec["entries"], rec["meta"]
+        first = entries[0]["report"].get("window", {}) if entries else {}
+        period = (f"{meta.get('start')} ~ {meta.get('end')}" if meta.get("mode") == "range"
+                  else f"最近{meta.get('days')}天")
+        subtitle = (f"{rec.get('name', '')}({meta.get('code')})　时间段：{period}　"
+                    f"区间：{first.get('first', '?')} ~ {first.get('last', '?')}　"
+                    f"共 {len(entries)} 种买卖条件（按收益率降序）")
+        self._rank_win.refresh(subtitle, entries)
+
+    def _open_leaderboard(self):
+        if self._rank_win is None:
+            self._rank_win = RankDialog(self)
+            self._rank_win.row_activated.connect(self._on_rank_row)
+            self._rank_win.scope_changed.connect(self._show_rank_scope)
+        self._populate_rank_scopes()
+        self._rank_win.show()
+        self._rank_win.raise_()
+        self._rank_win.activateWindow()
+
+    def _on_rank_row(self, idx):
+        rec = self._rank_store.get(self._rank_view_scope)
+        if rec and 0 <= idx < len(rec["entries"]):
+            rep = dict(rec["entries"][idx]["report"])
+            if not rep.get("series"):                 # 作用域级共享 series（旧数据可能已内嵌）
+                rep["series"] = rec.get("series", [])
+            self._open_kline(rec["meta"].get("code"), rec.get("name", ""), rep)
+
+    def _open_kline(self, code, name, report):
+        """非模态单例：开新K线窗前先关掉旧的，保证同时只存在一个K线窗口。"""
+        if self._kline_win is not None:
+            self._kline_win.close()
+        self._kline_win = KLineDialog(code, name, report, self, on_rank=self._open_leaderboard)
+        self._kline_win.finished.connect(lambda _r: setattr(self, "_kline_win", None))
+        self._kline_win.show()
+        self._kline_win.raise_()
+        self._kline_win.activateWindow()
 
 
 class MainWindow(QMainWindow):

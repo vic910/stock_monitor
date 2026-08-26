@@ -34,7 +34,7 @@ dist\stock_monitor.exe
 | 排序 | 每行末尾 ↑↓ 按钮点击调整顺序；⠿ 按钮长按拖拽插入任意位置，自动持久化 |
 | 常驻浮窗 | 支持任意数量股票，置顶显示，每行显示价格/涨跌幅/量比，整体可拖动；右键可修改背景色/字体颜色 |
 | 系统托盘 | 最小化后缩至右下角托盘图标，双击恢复，右键退出 |
-| 股票分析（回测） | 独立窗口，多行策略回测：站上/跌破X日线、冷却N天、MACD金叉/死叉、突破上次卖点（或条件）等多条件，点「确定」直接打开K线买卖点窗口（汇总+统计+买入持有对照+K线折线标买卖点+交易明细），10000股基数（见下节） |
+| 股票分析（回测） | 独立窗口，多行策略回测：站上/跌破X日线、冷却N天、MACD金叉/死叉、突破上次卖点（或条件）等多条件，点「确定」直接打开K线买卖点窗口（汇总+统计+买入持有对照+K线折线标买卖点+交易明细），并把结果记入**收益排行**（按股票+时间段分榜、收益率降序、持久化到本地），10000股基数（见下节） |
 | 配置持久化 | 股票列表/刷新间隔/N/M参数/浮窗背景色/浮窗字体颜色/我的做T策略/股票分析各行 自动保存 |
 
 ---
@@ -186,8 +186,9 @@ N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保
 - **买入并持有对照**：用首个买点买入并持有到区间末（不执行卖出）的盈亏与收益率，并标注策略相对持有「跑赢/跑输」多少
 - **K线折线（QPainter手绘）**：收盘价走势，买点红/卖点绿标在线上，鼠标悬停某点显示其日期/价格/单笔盈亏（盈亏红正绿负）
 - **交易明细表**：每笔买卖的日期、方向、价格、股数、单笔盈亏
+- **收益排行**：K线窗口底部「收益排行」按钮、以及策略回测表格「操作」列的「排行」按钮均可打开。排行按 **作用域=股票+时间段** 分榜，同一股票同时间段下不同买卖条件按 **收益率% 降序**；同一(买入,卖出)描述去重更新。榜单**持久化到本地**（`config.rank_store`），重启后仍可查看，窗口顶部下拉可切换查看每只股票的排行；点任意行打开该组合的K线窗口（同时只保留一个K线窗口）。**删整行股票**或**改时间段/股票**时，对应作用域的排行连同本地记录一起删除。
 
-> 每行的代码/时间类型/买卖条件在改动后自动保存（防抖），重启后自动还原（`config.analysis_rows`）。
+> 每行的代码/时间类型/买卖条件在改动后自动保存（防抖），重启后自动还原（`config.analysis_rows`）。收益排行按作用域存于 `config.rank_store`，`config.rank_last_scope` 记最近查看的作用域。
 
 ---
 
@@ -224,9 +225,13 @@ stock_monitor.py
 ├── _ConditionsCell           # 可增删的多条件单元格：买入侧分「且/或」两组，卖出侧单组
 ├── AnalysisWindow             # 股票分析窗口：多行策略回测，各行配置自动持久化
 │   ├── _add_row()/_del_row()  # 增删行；_save_rows/_schedule_save 防抖落盘 config.analysis_rows
-│   └── _run_row()             # 校验后起 BacktestWorker → 结果回 _on_result 直接开 KLineDialog
+│   ├── _run_row()             # 校验后起 BacktestWorker → 结果回 _on_result 直接开 KLineDialog
+│   ├── _record_rank()/_delete_scope()  # 收益排行：按作用域(股票+时间段)去重降序、落盘 config.rank_store
+│   ├── _on_row_scope_maybe_changed()   # 行的股票/时间段变化 → 删旧作用域排行（含本地）
+│   └── _open_leaderboard()/_open_kline()  # 打开排行窗（下拉切换作用域）/ 唯一非模态K线窗
+├── RankDialog                 # 收益排行窗口：作用域下拉 + 收益率降序表格，点行开对应K线窗
 ├── KLineChartWidget           # K线折线（QPainter手绘）：收盘价走势+买卖点红/绿标+悬停显示单点信息
-├── KLineDialog                # 回测结果窗口：汇总+统计+买入持有对照+K线折线+交易明细表
+├── KLineDialog                # 回测结果窗口：汇总+统计+买入持有对照+K线折线+交易明细+「收益排行」按钮
 └── MainWindow                 # 主窗口
     ├── _build_tray()          # 系统托盘图标+右键菜单
     ├── changeEvent()          # 最小化 → hide()，浮窗不受影响
@@ -294,12 +299,24 @@ stock_monitor.py
             "buy":  [{"type": "ma_above", "param": 8}],
             "sell": [{"type": "ma_below", "param": 10}]
         }
-    ]
+    ],
+    "rank_store": {
+        "600519|days|60": {
+            "name": "贵州茅台",
+            "meta": {"code": "600519", "mode": "days", "days": 60, "start": null, "end": null},
+            "entries": [
+                {"buy_desc": "站上5日线", "sell_desc": "跌破5日线",
+                 "trade_count": 3, "return_pct": 8.0, "total_pnl": 8000.0, "report": {}}
+            ]
+        }
+    },
+    "rank_last_scope": "600519|days|60"
 }
 ```
 
 > `t_strategy`：股票代码 → 我的做T策略下拉框索引（0 空 / 1 强势 / 2 震荡 / 3 弱势）。
 > `analysis_rows`：股票分析窗口各行配置。`mode` 为 `days`（用 `days`）或 `range`（用 `start`/`end`）；`buy`/`sell` 为条件列表，`type` ∈ 买入 `ma_above`/`cooldown`/`macd_golden`/`breakout_last_sell`、卖出 `ma_below`/`macd_death`，`param` 为日线周期或冷却天数（MACD/突破类无参数，param 忽略）。
+> `rank_store`：收益排行按作用域持久化。键为 `代码|days|N` 或 `代码|range|起|止`；值含 `name`/`meta` 及按收益率降序的 `entries`（每条存完整 `report`，重开K线不联网）。`rank_last_scope` 记最近查看的作用域。删整行股票或改时间段/股票时对应作用域会被移除。
 
 ---
 
