@@ -550,6 +550,13 @@ def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
     if any(c["type"] in ("macd_golden", "macd_death") for c in buy_conds + sell_conds):
         macd = _macd(closes)
 
+    # 「同时满足」规则用：买入侧「站上X日线」的周期 + 卖出侧是否含「跌破X日线」。
+    # 买入当天若卖出条件也已全部满足，则这一笔的「跌破X日线」改用买入周期 X（见 eff_sell_conds），
+    # 避免「站上5买、跌破10卖，进场即在10日线下、次日就被卖」这种刚进场就出场的不合理。
+    buy_ma_p = next((c["param"] for c in buy_conds if c["type"] == "ma_above"), None)
+    has_ma_sell = any(c["type"] == "ma_below" for c in sell_conds)
+    eff_sell_conds = sell_conds   # 当前持仓实际生效的卖出条件（默认与配置一致）
+
     n = len(closes)
     for i in range(start_idx, n):
         price = closes[i]
@@ -570,9 +577,17 @@ def run_backtest(dates, closes, buy_conds, sell_conds, start_idx, shares=10000):
                 buy_price = price
                 trades.append({"date": dates[i], "side": "买入", "price": price,
                                "shares": shares, "pnl": None})
+                # 买入当天卖出条件也全满足 → 这一笔的「跌破X日线」改用买入周期，避免刚进场就被卖
+                sell_now = bool(sell_conds) and all(
+                    _cond_met(c, closes, i, last_sell_idx, macd, last_sell_price) for c in sell_conds)
+                if sell_now and buy_ma_p is not None and has_ma_sell:
+                    eff_sell_conds = [dict(c, param=buy_ma_p) if c["type"] == "ma_below" else c
+                                      for c in sell_conds]
+                else:
+                    eff_sell_conds = sell_conds
         else:
-            if sell_conds and all(
-                    _cond_met(c, closes, i, last_sell_idx, macd, last_sell_price) for c in sell_conds):
+            if eff_sell_conds and all(
+                    _cond_met(c, closes, i, last_sell_idx, macd, last_sell_price) for c in eff_sell_conds):
                 pnl = (price - buy_price) * shares
                 realized += pnl
                 round_trips += 1
