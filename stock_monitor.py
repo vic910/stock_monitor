@@ -1071,11 +1071,15 @@ class RankDialog(QDialog):
     combo_requested = pyqtSignal(str)   # 点「组合排行」时发出当前作用域 scope_key
     scope_deleted = pyqtSignal(str)     # 点「删除此排行」时发出当前作用域 scope_key
     note_edited = pyqtSignal(str, str)  # 编辑备注时发出 (scope_key, 备注文本)
+    open_other = pyqtSignal(str)        # 「其他股票」下拉选中时发出该作用域 scope_key（外部新开窗口）
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("收益排行")
         self.resize(760, 440)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)  # 关闭即销毁，支持多开
+        self.filter_code = None   # 本窗口过滤的股票代码（None=全部）
+        self.view_scope = None    # 本窗口当前查看的作用域 scope_key
         lay = QVBoxLayout(self)
 
         top = QHBoxLayout()
@@ -1093,6 +1097,12 @@ class RankDialog(QDialog):
         self.del_btn.clicked.connect(self._on_delete_click)
         top.addWidget(self.del_btn)
         top.addStretch()
+        top.addWidget(QLabel("其他股票："))
+        self.other_box = QComboBox()
+        self.other_box.setMinimumWidth(220)
+        self.other_box.setToolTip("选择其他股票的排行，在新窗口打开")
+        self.other_box.activated.connect(self._on_other_activated)
+        top.addWidget(self.other_box)
         lay.addLayout(top)
         self._notes = {}   # scope_key → 备注文本（供编辑时回填输入框）
 
@@ -1181,6 +1191,23 @@ class RankDialog(QDialog):
             QMessageBox.information(self, "截图", f"已保存到：\n{path}")
         else:
             QMessageBox.warning(self, "截图", "保存失败。")
+
+    def _on_other_activated(self, idx):
+        """「其他股票」下拉当菜单用：选中即发信号新开窗口，随后复位到占位项。"""
+        key = self.other_box.itemData(idx)
+        self.other_box.setCurrentIndex(0)
+        if key:
+            self.open_other.emit(key)
+
+    def set_others(self, items):
+        """填充「其他股票」下拉。items：[(scope_key, 标签)]；首项为占位提示（data=None）。"""
+        self.other_box.blockSignals(True)
+        self.other_box.clear()
+        self.other_box.addItem("其他股票的排行…", None)
+        for key, label in items:
+            self.other_box.addItem(label, key)
+        self.other_box.setCurrentIndex(0)
+        self.other_box.blockSignals(False)
 
     def set_scopes(self, items, current_key, notes=None):
         """items：[(scope_key, 显示标签)]；current_key：默认选中项；notes：scope_key→备注（用于编辑回填）。
@@ -1838,12 +1865,11 @@ class AnalysisWindow(QWidget):
         # 收益排行：按作用域(股票+时间段)持久化到本地 config；每只/每时间段各存一张榜
         self._rank_store = self.config.get("rank_store") or {}   # scope_key → {name, meta, entries}
         self._rank_active_scope = self.config.get("rank_last_scope")  # 最近一次回测的作用域
-        self._rank_view_scope = self._rank_active_scope          # 排行榜当前查看的作用域
         self._kline_win = None   # 唯一 K线窗口（非模态单例）
-        self._rank_win = None    # 唯一 收益排行窗口（非模态单例）
+        self._rank_wins = []     # 收益排行窗口（可多开）；每个窗口自带 filter_code / view_scope
         self._combo_worker = None  # 「组合排行」后台线程
+        self._combo_win = None     # 发起「组合排行」的那个排行窗口（用于回收 loading 状态）
         self._open_worker = None   # 点排行某行时即时重算该组合的后台线程
-        self._rank_filter_code = None  # 排行榜下拉过滤：仅显示该股票的各时间段（None=全部）
         self._save_timer = QTimer(self)      # 变更防抖：多次快速改动只落盘一次
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(400)
@@ -2056,21 +2082,37 @@ class AnalysisWindow(QWidget):
         self.config["rank_last_scope"] = self._rank_active_scope
         save_config(self.config)
 
+    def _rank_wins_alive(self):
+        """当前仍存活（未被 WA_DeleteOnClose 销毁）的排行窗口列表。"""
+        alive = []
+        for w in list(self._rank_wins):
+            try:
+                w.isVisible()          # 已销毁的 C++ 对象访问会抛 RuntimeError
+                alive.append(w)
+            except RuntimeError:
+                self._rank_wins.remove(w)
+        return alive
+
+    def _refresh_all_wins(self):
+        """存储发生变化后，刷新所有打开的排行窗口（下拉+其他股票+表格）。"""
+        for w in self._rank_wins_alive():
+            self._populate_win(w)
+
     def _delete_scope(self, key):
-        """删除某作用域的排行并落盘；若正被查看/激活则回退到其它作用域。"""
+        """删除某作用域的排行并落盘；被删的作用域若正被某窗口查看则回退。"""
         if key not in self._rank_store:
             return
         del self._rank_store[key]
         if self._rank_active_scope == key:
             self._rank_active_scope = next(iter(self._rank_store), None)
-        if self._rank_view_scope == key:
-            self._rank_view_scope = self._rank_active_scope
+        for w in self._rank_wins_alive():
+            if w.view_scope == key:
+                w.view_scope = None
         self._save_rank()
-        if self._rank_win is not None and self._rank_win.isVisible():
-            self._populate_rank_scopes()
+        self._refresh_all_wins()
 
     def _set_scope_note(self, key, note):
-        """给某作用域设置/清除备注并落盘，刷新下拉与副标题。"""
+        """给某作用域设置/清除备注并落盘，刷新所有窗口的下拉与副标题。"""
         rec = self._rank_store.get(key)
         if rec is None:
             return
@@ -2079,8 +2121,7 @@ class AnalysisWindow(QWidget):
         else:
             rec.pop("note", None)
         self._save_rank()
-        if self._rank_win is not None and self._rank_win.isVisible():
-            self._populate_rank_scopes()
+        self._refresh_all_wins()
 
     def _delete_scopes_for_code(self, code):
         """删除某股票代码下所有时间段的排行（scope_key 均以 '{code}|' 打头）。"""
@@ -2120,31 +2161,40 @@ class AnalysisWindow(QWidget):
         entries.sort(key=lambda e: e["return_pct"], reverse=True)
         rec["entries"] = entries
         self._rank_active_scope = key
-        self._rank_view_scope = key
         self._save_rank()
-        if self._rank_win is not None and self._rank_win.isVisible():
-            self._populate_rank_scopes()
+        # 新结果所属股票的窗口切到该作用域；其余窗口只刷新下拉/其他股票
+        for w in self._rank_wins_alive():
+            if not w.filter_code or key.startswith(f"{w.filter_code}|"):
+                w.view_scope = key
+        self._refresh_all_wins()
 
-    def _populate_rank_scopes(self):
-        """把本地所有作用域填进下拉，默认选中当前查看/激活的那个，并刷新表格。"""
+    def _populate_win(self, w):
+        """填充某个排行窗口：主下拉（本窗口作用域）+ 其他股票下拉 + 表格。"""
         keys = list(self._rank_store.keys())
-        if self._rank_filter_code:                       # 只显示该股票的各时间段
-            prefix = f"{self._rank_filter_code}|"
-            keys = [k for k in keys if k.startswith(prefix)]
-        items = [(k, self._scope_label(k)) for k in keys]
-        notes = {k: (self._rank_store[k].get("note") or "") for k in keys}
-        cur = self._rank_view_scope
-        if cur not in keys:
-            cur = (self._rank_active_scope if self._rank_active_scope in keys
-                   else (items[0][0] if items else None))
-        self._rank_win.set_scopes(items, cur, notes)
-        self._show_rank_scope(cur)
+        if w.filter_code:                                # 只显示该股票的各时间段
+            prefix = f"{w.filter_code}|"
+            shown = [k for k in keys if k.startswith(prefix)]
+        else:
+            shown = keys
+        items = [(k, self._scope_label(k)) for k in shown]
+        notes = {k: (self._rank_store[k].get("note") or "") for k in shown}
+        cur = w.view_scope
+        if cur not in shown:
+            cur = (self._rank_active_scope if self._rank_active_scope in shown
+                   else (shown[0] if shown else None))
+        w.set_scopes(items, cur, notes)
+        # 其他股票：不属于本窗口当前股票代码的作用域，供一键新开窗口
+        cur_code = w.filter_code or (cur.split("|")[0] if cur else None)
+        others = [(k, self._scope_label(k)) for k in keys
+                  if not (cur_code and k.startswith(f"{cur_code}|"))]
+        w.set_others(others)
+        self._show_rank_scope(w, cur)
 
-    def _show_rank_scope(self, key):
-        self._rank_view_scope = key
+    def _show_rank_scope(self, w, key):
+        w.view_scope = key
         rec = self._rank_store.get(key)
         if not rec:
-            self._rank_win.refresh("还没有排行记录。在某行点「确定」跑一次，收益就会进入排行。", [])
+            w.refresh("还没有排行记录。在某行点「确定」跑一次，收益就会进入排行。", [])
             return
         entries, meta = rec["entries"], rec["meta"]
         period = (f"{meta.get('start')} ~ {meta.get('end')}" if meta.get("mode") == "range"
@@ -2155,25 +2205,48 @@ class AnalysisWindow(QWidget):
             subtitle += f"　区间买入持有：{rec['hold_pct']:+.2f}%"
         if rec.get("note"):
             subtitle += f"　备注：{rec['note']}"
-        self._rank_win.refresh(subtitle, entries)
+        w.refresh(subtitle, entries)
+
+    def _make_rank_win(self, filter_code=None, focus_scope=None):
+        """新建一个排行窗口并接线；filter_code 过滤下拉，focus_scope 为默认查看的作用域。"""
+        w = RankDialog(self)
+        w.filter_code = (filter_code or "").strip().upper() or None
+        w.view_scope = focus_scope
+        w.row_activated.connect(lambda idx, ww=w: self._on_rank_row(ww, idx))
+        w.scope_changed.connect(lambda key, ww=w: self._show_rank_scope(ww, key))
+        w.combo_requested.connect(lambda key, ww=w: self._run_combo(ww, key))
+        w.scope_deleted.connect(self._delete_scope)      # 存储级：改完刷新所有窗口
+        w.note_edited.connect(self._set_scope_note)      # 存储级：改完刷新所有窗口
+        w.open_other.connect(self._on_open_other)
+        w.finished.connect(lambda _r, ww=w: self._rank_wins.remove(ww)
+                           if ww in self._rank_wins else None)
+        self._rank_wins.append(w)
+        self._populate_win(w)
+        w.show()
+        w.raise_()
+        w.activateWindow()
+        return w
 
     def _open_leaderboard(self, code=None):
-        # code 非空 → 下拉只显示该股票的各时间段作用域；为空则显示全部
-        self._rank_filter_code = (code or "").strip().upper() or None
-        if self._rank_win is None:
-            self._rank_win = RankDialog(self)
-            self._rank_win.row_activated.connect(self._on_rank_row)
-            self._rank_win.scope_changed.connect(self._show_rank_scope)
-            self._rank_win.combo_requested.connect(self._run_combo)
-            self._rank_win.scope_deleted.connect(self._delete_scope)
-            self._rank_win.note_edited.connect(self._set_scope_note)
-        self._populate_rank_scopes()
-        self._rank_win.show()
-        self._rank_win.raise_()
-        self._rank_win.activateWindow()
+        """打开某股票的排行窗：已有同股票的窗口则前置复用，否则新建。"""
+        fc = (code or "").strip().upper() or None
+        for w in self._rank_wins_alive():
+            if w.filter_code == fc:
+                self._populate_win(w)
+                w.show()
+                w.raise_()
+                w.activateWindow()
+                return w
+        return self._make_rank_win(filter_code=fc)
 
-    def _on_rank_row(self, idx):
-        rec = self._rank_store.get(self._rank_view_scope)
+    def _on_open_other(self, scope_key):
+        """「其他股票」下拉选中某作用域：以该股票为过滤、聚焦该作用域，新开一个窗口。"""
+        code = scope_key.split("|")[0]
+        w = self._make_rank_win(filter_code=code, focus_scope=scope_key)
+        return w
+
+    def _on_rank_row(self, w, idx):
+        rec = self._rank_store.get(w.view_scope)
         if not (rec and 0 <= idx < len(rec["entries"])):
             return
         e = rec["entries"][idx]
@@ -2197,23 +2270,32 @@ class AnalysisWindow(QWidget):
         self._open_worker.start()
 
     # ── 组合排行：枚举全部 50 种买卖组合、跑回测、并入该作用域榜单 ──
-    def _run_combo(self, scope_key):
+    def _run_combo(self, w, scope_key):
         rec = self._rank_store.get(scope_key)
         if not rec:
             QMessageBox.information(self, "组合排行", "该作用域还没有数据。")
             return
+        if self._combo_worker is not None:
+            QMessageBox.information(self, "组合排行", "已有一个组合排行在计算，请稍候。")
+            return
         m = rec["meta"]
+        self._combo_win = w
         self._combo_worker = ComboWorker(scope_key, m.get("code"), m.get("mode"),
                                          m.get("days"), m.get("start"), m.get("end"))
         self._combo_worker.done.connect(self._on_combo_done)
         self._combo_worker.error.connect(self._on_combo_error)
-        if self._rank_win is not None:
-            self._rank_win.set_combo_running(True)
+        w.set_combo_running(True)
         self._combo_worker.start()
 
+    def _combo_stop_loading(self):
+        """结束「组合排行」：清 loading（发起窗口若还在）、释放 worker 引用。"""
+        if self._combo_win is not None and self._combo_win in self._rank_wins_alive():
+            self._combo_win.set_combo_running(False)
+        self._combo_win = None
+        self._combo_worker = None
+
     def _on_combo_done(self, scope_key, name, hold_pct, entries_json):
-        if self._rank_win is not None:
-            self._rank_win.set_combo_running(False)
+        self._combo_stop_loading()
         rec = self._rank_store.get(scope_key)
         if rec is None:      # 作用域可能已被删除（改时间段/删行），忽略这批结果
             return
@@ -2230,14 +2312,14 @@ class AnalysisWindow(QWidget):
         entries.sort(key=lambda e: e["return_pct"], reverse=True)
         rec["entries"] = entries
         self._rank_active_scope = scope_key
-        self._rank_view_scope = scope_key
+        for w in self._rank_wins_alive():
+            if not w.filter_code or scope_key.startswith(f"{w.filter_code}|"):
+                w.view_scope = scope_key
         self._save_rank()
-        if self._rank_win is not None and self._rank_win.isVisible():
-            self._populate_rank_scopes()
+        self._refresh_all_wins()
 
     def _on_combo_error(self, scope_key, msg):
-        if self._rank_win is not None:
-            self._rank_win.set_combo_running(False)
+        self._combo_stop_loading()
         QMessageBox.warning(self, "组合排行失败", msg)
 
     def _open_kline(self, code, name, report):
