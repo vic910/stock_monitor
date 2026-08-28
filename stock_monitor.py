@@ -1252,6 +1252,154 @@ class RankDialog(QDialog):
             h.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
 
 
+class AnalyzeDialog(QDialog):
+    """配置分析（纯本地统计，零 token）：勾选若干作用域榜单，按「买入策略」归并。
+    每种买法给出：样本数、平均收益率、胜率、最好/最差、中位数。
+    胜率 = 组内条目收益率跑赢其所属榜单「区间买入持有」基准的占比。
+    """
+
+    def __init__(self, scopes, parent=None):
+        # scopes：[(key, label, entry_count, hold_pct, entries)] —— 只读快照
+        super().__init__(parent)
+        self.setWindowTitle("配置分析 · 按买入策略")
+        self.resize(840, 580)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._scopes = scopes
+        lay = QVBoxLayout(self)
+
+        lay.addWidget(QLabel("勾选要分析的排行（默认全选），点「开始分析」按买入策略归并统计（纯本地计算）："))
+
+        tools = QHBoxLayout()
+        btn_all = QPushButton("全选"); btn_all.setFixedWidth(70)
+        btn_none = QPushButton("全不选"); btn_none.setFixedWidth(70)
+        btn_all.clicked.connect(lambda: self._check_all(True))
+        btn_none.clicked.connect(lambda: self._check_all(False))
+        tools.addWidget(btn_all)
+        tools.addWidget(btn_none)
+        tools.addStretch()
+        tools.addWidget(QLabel("归并维度："))
+        self.dim_box = QComboBox()
+        for label, key in (("按买入策略", "buy"), ("按卖出策略", "sell"), ("按买卖组合", "combo")):
+            self.dim_box.addItem(label, key)
+        self.dim_box.activated.connect(lambda _i: self._run())
+        tools.addWidget(self.dim_box)
+        self.run_btn = QPushButton("开始分析")
+        self.run_btn.clicked.connect(self._run)
+        tools.addWidget(self.run_btn)
+        lay.addLayout(tools)
+
+        # 勾选表：勾选(在第0列文字前) | 条目数 | 买入持有%
+        self.pick = QTableWidget(0, 3)
+        self.pick.setHorizontalHeaderLabels(["排行（股票 · 时间段）", "条目数", "买入持有%"])
+        self.pick.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.pick.verticalHeader().setVisible(False)
+        self.pick.setRowCount(len(scopes))
+        for r, (_key, label, cnt, hold, _entries) in enumerate(scopes):
+            it = QTableWidgetItem(label)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked)
+            self.pick.setItem(r, 0, it)
+            self.pick.setItem(r, 1, QTableWidgetItem(str(cnt)))
+            self.pick.setItem(r, 2, QTableWidgetItem(f"{hold:+.2f}" if hold is not None else "—"))
+        ph = self.pick.horizontalHeader()
+        ph.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        ph.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        ph.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        lay.addWidget(self.pick, 1)
+
+        self.subtitle = QLabel("")
+        self.subtitle.setStyleSheet("color:#555; font-size:12px;")
+        self.subtitle.setWordWrap(True)
+        lay.addWidget(self.subtitle)
+
+        self.result = QTableWidget(0, 7)
+        self.result.setHorizontalHeaderLabels(
+            ["买入策略", "样本数", "平均收益率%", "胜率%", "最好%", "最差%", "中位数%"])
+        self.result.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.result.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.result.verticalHeader().setVisible(False)
+        lay.addWidget(self.result, 2)
+
+        if scopes:
+            self._run()   # 默认全选，进来直接出一版
+
+    def _check_all(self, checked):
+        st = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for r in range(self.pick.rowCount()):
+            self.pick.item(r, 0).setCheckState(st)
+
+    @staticmethod
+    def _median(xs):
+        s = sorted(xs)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        m = n // 2
+        return s[m] if n % 2 else (s[m - 1] + s[m]) / 2
+
+    def _run(self):
+        dim = self.dim_box.currentData()          # buy / sell / combo
+        dim_name = {"buy": "买入策略", "sell": "卖出策略", "combo": "买卖组合"}[dim]
+        # 收集勾选榜单的所有条目，带上各自「买入持有」基准判定胜负
+        rows = []            # (归并键, return_pct, win_bool)
+        n_scope = 0
+        for r, (_key, _label, _cnt, hold, entries) in enumerate(self._scopes):
+            if self.pick.item(r, 0).checkState() != Qt.CheckState.Checked:
+                continue
+            n_scope += 1
+            base = hold if hold is not None else 0.0
+            for e in entries:
+                ret = e.get("return_pct", 0.0)
+                buy, sell = e.get("buy_desc", "？"), e.get("sell_desc", "？")
+                gkey = {"buy": buy, "sell": sell, "combo": f"{buy} → {sell}"}[dim]
+                rows.append((gkey, ret, ret > base))
+
+        groups = {}
+        for gkey, ret, win in rows:
+            groups.setdefault(gkey, []).append((ret, win))
+        stats = []
+        for gkey, items in groups.items():
+            rets = [x[0] for x in items]
+            wins = sum(1 for x in items if x[1])
+            stats.append({
+                "key": gkey, "n": len(items),
+                "mean": sum(rets) / len(rets),
+                "winr": 100.0 * wins / len(items),
+                "best": max(rets), "worst": min(rets),
+                "med": self._median(rets),
+            })
+        stats.sort(key=lambda s: s["mean"], reverse=True)
+
+        self.result.setHorizontalHeaderLabels(
+            [dim_name, "样本数", "平均收益率%", "胜率%", "最好%", "最差%", "中位数%"])
+        self.subtitle.setText(
+            f"共分析 {n_scope} 个榜单、{len(rows)} 个条目，归并出 {len(stats)} 种{dim_name}"
+            f"（按平均收益率降序；胜率=跑赢各自「买入持有」基准的占比）。")
+
+        red, green, gray = "#e74c3c", "#27ae60", "#888888"
+        col = lambda v: red if v > 0 else (green if v < 0 else gray)
+        self.result.setRowCount(len(stats))
+        for r, s in enumerate(stats):
+            cells = [
+                (s["key"], None),
+                (str(s["n"]), None),
+                (f"{s['mean']:+.2f}", QColor(col(s["mean"]))),
+                (f"{s['winr']:.0f}", None),
+                (f"{s['best']:+.2f}", QColor(col(s["best"]))),
+                (f"{s['worst']:+.2f}", QColor(col(s["worst"]))),
+                (f"{s['med']:+.2f}", QColor(col(s["med"]))),
+            ]
+            for c, (text, fg) in enumerate(cells):
+                it = QTableWidgetItem(text)
+                if fg:
+                    it.setForeground(fg)
+                self.result.setItem(r, c, it)
+        rh = self.result.horizontalHeader()
+        rh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for c in range(1, 7):
+            rh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+
+
 class FloatWidget(QWidget):
     """常驻最顶层浮窗，支持任意数量股票，每行：价格  涨跌幅
     内部状态：
@@ -1870,6 +2018,7 @@ class AnalysisWindow(QWidget):
         self._combo_worker = None  # 「组合排行」后台线程
         self._combo_win = None     # 发起「组合排行」的那个排行窗口（用于回收 loading 状态）
         self._open_worker = None   # 点排行某行时即时重算该组合的后台线程
+        self._analyze_win = None   # 「分析配置」窗口（非模态单例）
         self._save_timer = QTimer(self)      # 变更防抖：多次快速改动只落盘一次
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(400)
@@ -1881,6 +2030,11 @@ class AnalysisWindow(QWidget):
         btn_add.setFixedWidth(90)
         btn_add.clicked.connect(self._add_row)
         top.addWidget(btn_add)
+        btn_analyze = QPushButton("分析配置")
+        btn_analyze.setFixedWidth(90)
+        btn_analyze.setToolTip("按买入策略归并统计所有排行的收益率/胜率（纯本地计算，不消耗流量）")
+        btn_analyze.clicked.connect(self._open_analyze)
+        top.addWidget(btn_analyze)
         top.addWidget(QLabel("每列多条件为「同时满足」；按 10000 股为买卖基数，毛收益（不计手续费）"))
         top.addStretch()
         lay.addLayout(top)
@@ -2321,6 +2475,23 @@ class AnalysisWindow(QWidget):
     def _on_combo_error(self, scope_key, msg):
         self._combo_stop_loading()
         QMessageBox.warning(self, "组合排行失败", msg)
+
+    def _open_analyze(self):
+        """打开「配置分析」窗口：把当前所有作用域榜单快照传入，按买入策略归并统计（离线）。"""
+        if not self._rank_store:
+            QMessageBox.information(self, "分析配置",
+                                    "还没有任何排行数据。先在某行点「确定」跑一次回测再来分析。")
+            return
+        scopes = [(k, self._scope_label(k), len(rec.get("entries", [])),
+                   rec.get("hold_pct"), rec.get("entries", []))
+                  for k, rec in self._rank_store.items()]
+        if self._analyze_win is not None:      # 单例：重开先关旧的，避免数据过期
+            self._analyze_win.close()
+        self._analyze_win = AnalyzeDialog(scopes, self)
+        self._analyze_win.finished.connect(lambda _r: setattr(self, "_analyze_win", None))
+        self._analyze_win.show()
+        self._analyze_win.raise_()
+        self._analyze_win.activateWindow()
 
     def _open_kline(self, code, name, report):
         """非模态单例：开新K线窗前先关掉旧的，保证同时只存在一个K线窗口。"""
