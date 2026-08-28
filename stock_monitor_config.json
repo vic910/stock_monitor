@@ -1,10 +1,23 @@
 {
-    "stocks": [
-        "399006",
-        "159995",
-        "513120",
-        "513050"
-    ],
-    "interval": 5,
-    "server_key": ""
+    "analysis_rows": [
+        {
+            "code": "513050",
+            "mode": "days",
+            "days": 60,
+            "start": "",
+            "end": "",
+            "buy": [
+                {
+                    "type": "ma_above",
+                    "param": 5
+                }
+            ],
+            "sell": [
+                {
+                    "type": "ma_below",
+                    "param": 10
+                }
+            ]
+        }
+    ]
 }

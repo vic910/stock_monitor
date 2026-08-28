@@ -2040,10 +2040,10 @@ class AnalysisWindow(QWidget):
         lay.addLayout(top)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["股票代码", "时间类型", "买入策略", "卖出策略", "操作"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["股票代码 / 操作", "时间类型", "买入策略", "卖出策略"])
         h = self.table.horizontalHeader()
-        for i in range(5):
+        for i in range(4):
             h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setDefaultSectionSize(56)
         lay.addWidget(self.table)
@@ -2064,7 +2064,6 @@ class AnalysisWindow(QWidget):
         code_cell = _CodeCell(d.get("code", ""))
         time_cell = _TimeTypeCell(d.get("mode", "days"), d.get("days", 60),
                                   d.get("start", ""), d.get("end", ""))
-        self.table.setCellWidget(r, 0, code_cell)
         self.table.setCellWidget(r, 1, time_cell)
         buy_cell = _ConditionsCell("buy", d.get("buy"))
         sell_cell = _ConditionsCell("sell", d.get("sell"))
@@ -2082,24 +2081,33 @@ class AnalysisWindow(QWidget):
         self.table.setCellWidget(r, 2, buy_cell)
         self.table.setCellWidget(r, 3, sell_cell)
 
-        op = QWidget()
-        ol = QHBoxLayout(op)
-        ol.setContentsMargins(2, 2, 2, 2)
+        # 第0列：股票代码单元格 + 操作按钮（确定/排行/删除）合并成一列
+        cell0 = QWidget()
+        c0 = QVBoxLayout(cell0)
+        c0.setContentsMargins(4, 2, 4, 2)
+        c0.setSpacing(3)
+        c0.addWidget(code_cell)
+        ol = QHBoxLayout()
+        ol.setContentsMargins(0, 0, 0, 0)
         ol.setSpacing(4)
         btn_run = QPushButton("确定")
-        btn_run.setFixedWidth(56)
+        btn_run.setFixedWidth(52)
         btn_rank = QPushButton("排行")
-        btn_rank.setFixedWidth(56)
+        btn_rank.setFixedWidth(52)
         btn_del = QPushButton("删除")
-        btn_del.setFixedWidth(56)
-        btn_run.clicked.connect(lambda: self._run_row(op))
+        btn_del.setFixedWidth(52)
+        btn_run.clicked.connect(lambda: self._run_row(cell0))
         # 从某行进排行榜：下拉只显示这只股票的各时间段（首个 checked 参数吞掉 clicked 的布尔实参）
         btn_rank.clicked.connect(lambda checked=False, cc=code_cell: self._open_leaderboard(cc.value()))
-        btn_del.clicked.connect(lambda: self._del_row(op))
+        btn_del.clicked.connect(lambda: self._del_row(cell0))
         ol.addWidget(btn_run)
         ol.addWidget(btn_rank)
         ol.addWidget(btn_del)
-        self.table.setCellWidget(r, 4, op)
+        ol.addStretch()
+        c0.addLayout(ol)
+        cell0.code_cell = code_cell   # 供各处取代码值/回填股票名
+        cell0.btn_run = btn_run       # 供 _run_row 跑时置灰
+        self.table.setCellWidget(r, 0, cell0)
         self.table.resizeRowsToContents()
         self._schedule_save()
 
@@ -2114,7 +2122,7 @@ class AnalysisWindow(QWidget):
         for r in range(self.table.rowCount()):
             mode, days, start, end = self.table.cellWidget(r, 1).value()
             rows.append({
-                "code": self.table.cellWidget(r, 0).value(),
+                "code": self.table.cellWidget(r, 0).code_cell.value(),
                 "mode": mode, "days": days, "start": start, "end": end,
                 "buy": self.table.cellWidget(r, 2).value(),
                 "sell": self.table.cellWidget(r, 3).value(),
@@ -2132,25 +2140,25 @@ class AnalysisWindow(QWidget):
 
     def _widget_row(self, widget):
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 4) is widget:
+            if self.table.cellWidget(r, 0) is widget:
                 return r
         return -1
 
-    def _del_row(self, op_widget):
-        r = self._widget_row(op_widget)
+    def _del_row(self, cell0):
+        r = self._widget_row(cell0)
         if r >= 0:
-            code_cell = self.table.cellWidget(r, 0)
+            code_cell = self.table.cellWidget(r, 0).code_cell
             code = code_cell.value() if code_cell else ""
             if code and len(code) >= 2:      # 删整行股票 → 连带删掉它「所有时间段」的排行（含本地）
                 self._delete_scopes_for_code(code)
             self.table.removeRow(r)
             self._schedule_save()
 
-    def _run_row(self, op_widget):
-        r = self._widget_row(op_widget)
+    def _run_row(self, cell0):
+        r = self._widget_row(cell0)
         if r < 0:
             return
-        code_cell = self.table.cellWidget(r, 0)
+        code_cell = self.table.cellWidget(r, 0).code_cell
         code = code_cell.value()
         if not code or len(code) < 2:
             QMessageBox.warning(self, "提示", "请先填写股票代码")
@@ -2168,8 +2176,8 @@ class AnalysisWindow(QWidget):
             QMessageBox.warning(self, "提示", "起始日期不能晚于截止日期")
             return
 
-        # 找到该行的「确定」按钮，跑的时候禁用
-        btn_run = op_widget.layout().itemAt(0).widget()
+        # 该行的「确定」按钮，跑的时候禁用
+        btn_run = cell0.btn_run
         btn_run.setEnabled(False)
         btn_run.setText("...")
 
