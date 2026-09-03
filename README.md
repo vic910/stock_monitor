@@ -1,6 +1,6 @@
 # 股票监控工具 stock_monitor
 
-A股/ETF/期指/港股实时监控桌面工具。支持多股票监控、综合趋势判断、均线状态、成交活跃度、两市成交额图表、策略回测、置顶浮窗、系统托盘。
+A股/ETF/期指/港股实时监控桌面工具。支持多股票监控、综合趋势判断、均线状态、成交活跃度、两市成交额图表、策略回测、组合寻优、AI 诊股、置顶浮窗、系统托盘。
 
 ---
 
@@ -35,10 +35,12 @@ dist\stock_monitor.exe
 | 常驻浮窗 | 支持任意数量股票，置顶显示，每行显示价格/涨跌幅/量比，整体可拖动；右键可修改背景色/字体颜色 |
 | 系统托盘 | 最小化后缩至右下角托盘图标，双击恢复，右键退出 |
 | 股票分析（回测） | 独立窗口，多行策略回测：站上/跌破X日线、MACD金叉/死叉、突破上次卖点（或条件）等多条件，点「确定」直接打开K线买卖点窗口（汇总+统计+买入持有对照+K线折线标买卖点+交易明细），并把结果记入**收益排行**（按股票+时间段分榜、收益率降序、持久化到本地），10000股基数（见下节） |
-| 组合排行（50种） | 排行窗口一键枚举 **50 种买卖组合**（买入站上5/10/20/30日线、MACD金叉，各可选「或突破上次卖点」× 卖出跌破5/10/20/30日线、MACD死叉），只拉一次日K在内存里批量回测，合并进当前作用域榜单（见下节） |
+| 组合寻优（196种） | 排行窗口一键枚举 **196 种买卖组合**（买入站上3/5/10/20/30/60日线、MACD金叉，各可选叠加冷却5天、各可选「或突破上次卖点」× 卖出跌破3/5/10/20/30/60日线、MACD死叉），只拉一次日K在内存里批量回测，合并进当前作用域榜单，附带收益率/胜率/综合评分（见下节） |
+| 排行多维排序 | 排行窗口顶部可按 **综合评分 / 收益率 / 胜率 / 交易次数** 切换排序，勾选「**仅交易次数≥3**」过滤只成交一两笔的偶然高收益（见下节） |
+| AI 诊股 | 主窗口右键行「**AI 诊股**」、或 K线窗口「**AI 解读**」按钮，让大模型基于当前技术面（均线/量比/MACD 等）中文分析。支持 **Anthropic（Claude）/ OpenAI 兼容** 两类接口，只用标准库 urllib、无第三方依赖，密钥仅存本地（见下节） |
 | 排行辅助 | 排行窗口支持：**区间买入持有**收益对照、**删除单个作用域**、给作用域加**备注**（下拉标签同步显示）、**一键截图**整窗保存到配置目录、「**其他股票**」下拉一键在**新窗口**打开别的票的排行（可多开） |
 | 配置分析 | 分析窗口「分析配置」按钮打开独立窗：勾选若干排行榜单，按**买入策略 / 卖出策略 / 买卖组合**三种维度之一归并，算每种的**样本数、平均收益率、胜率、最好/最差、中位数**，按平均收益率降序。**纯本地统计**（不联网、不消耗任何流量），秒出且结果可复现（见下节） |
-| 配置持久化 | 股票列表/刷新间隔/N/M参数/浮窗背景色/浮窗字体颜色/我的做T策略/股票分析各行 自动保存 |
+| 配置持久化 | 股票列表/刷新间隔/N/M参数/浮窗背景色/浮窗字体颜色/我的做T策略/股票分析各行/AI 接口配置 自动保存 |
 
 ---
 
@@ -197,12 +199,16 @@ N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保
 | 功能 | 说明 |
 |---|---|
 | 作用域下拉 | 切换查看不同股票/时间段的排行。从某只票的「排行」按钮进入时，下拉**只列该票**的各时间段；标签只显示股票名（超 4 字截断加「…」），不显示代码 |
-| 其他股票下拉 | 列出**当前窗口股票以外**的各作用域，选中即在**新窗口**打开该票排行（当作快捷菜单，选后复位）。同股票再次打开会**复用并前置**已有窗口；每个窗口关闭即销毁，删除/备注/组合排行完成等改动会刷新所有打开的窗口 |
+| 其他股票下拉 | 列出**当前窗口股票以外**的各作用域，选中即在**新窗口**打开该票排行（当作快捷菜单，选后复位）。同股票再次打开会**复用并前置**已有窗口；每个窗口关闭即销毁，删除/备注/组合寻优完成等改动会刷新所有打开的窗口 |
 | 区间买入持有 | 副标题显示「区间首日买入、持有到区间末」的收益率，作为策略优劣的基准对照 |
-| 组合排行(50种) | 一键枚举 50 种买卖组合，**只拉一次日K**（进程级缓存 `_backtest_kline_cache`，改条件不再联网），内存里批量回测后合并进当前作用域榜单，去重降序。枚举集合为**硬编码**，新增条件类型不会自动纳入 |
+| 排序依据 | 顶部下拉按 **综合评分 / 收益率 / 胜率 / 交易次数** 降序切换（默认综合评分）。196 行时纯排序/过滤不重算列宽、批量填充关重绘，避免卡顿 |
+| 仅交易次数≥3 | 勾选后过滤掉只成交一两笔的组合，规避样本过少的偶然高收益 |
+| 组合寻优(196种) | 一键枚举 196 种买卖组合，**只拉一次日K**（进程级缓存 `_backtest_kline_cache`，改条件不再联网），内存里批量回测后合并进当前作用域榜单，去重降序，每条附收益率/胜率/最大回撤/综合评分。枚举集合为**硬编码**，新增条件类型不会自动纳入 |
 | 备注 | 给当前作用域加一句备注，下拉标签与副标题同步显示 |
 | 删除此排行 | 删除当前选中的**单个**作用域（含本地记录），二次确认 |
 | 截图 | 抓取整个排行窗口存为 PNG，文件名取当前下拉标签，直接保存到配置目录（与 json 同目录） |
+
+**综合评分公式：** `综合评分 = 收益率% × (胜率 / 100) × min(1, 交易次数 / 3)`。用交易次数因子惩罚样本过少的偶然高收益，作为默认排序依据，兼顾收益、稳定性与样本量。排行表列为：排名 / 买入策略 / 卖出策略 / 交易次数 / 胜率% / 收益率% / 综合评分 / 总盈亏（早期未记胜率/评分的旧条目显示 `--`）。
 
 **删除语义：** 改某行的时间段/股票**不再**删除旧排行（保留供对照）；只有**删整行股票**才会删除该股票代码下的**所有**时间段排行（含本地记录）。
 
@@ -220,6 +226,35 @@ N、M 在界面顶部输入框设置（默认 N=5，M=20），修改后自动保
 - **胜率定义**：组内条目的 `return_pct` **跑赢其所属榜单的「区间买入持有」基准** 的占比。
 
 > 只读 `rank_store` 快照，不改任何存储结构、不动回测逻辑。
+
+---
+
+## AI 诊股
+
+让大模型基于当前**技术面**（不含基本面/消息面）给出中文分析。**只用标准库 `urllib`**，无第三方 SDK 依赖，不增加 exe 体积。
+
+**入口：**
+
+| 入口 | 位置 |
+|---|---|
+| AI 设置 | 主窗口顶部「AI 设置」按钮：选接口类型、填 Base URL / API Key / 模型 |
+| AI 诊股 | 主窗口表格**右键行** → 「AI 诊股：{名称}」 |
+| AI 解读 | 回测 K线窗口底部「AI 解读」按钮 |
+
+**接口类型（二选一）：**
+
+| 类型 | 请求地址 | 鉴权 | 默认模型 |
+|---|---|---|---|
+| Anthropic (Claude) | `{base}/v1/messages`（base 默认 `https://api.anthropic.com`） | 头 `x-api-key` + `anthropic-version` | `claude-opus-5` |
+| OpenAI 兼容 | `{base}/chat/completions`（base 需含 `/v1`，默认 `https://api.openai.com/v1`） | 头 `Authorization: Bearer` | `gpt-4o-mini` |
+
+> OpenAI 兼容端点可对接通义千问 / DeepSeek / 智谱等（填各自 base_url + model）。Base URL / 模型留空则用上表默认；国内直连易超时，可填中转域名。
+
+**上下文采集：** 诊股前自动拉一次该股票数据，拼出代码/名称、最新价/当日涨跌幅/近20日涨幅、MA5/10/20/30/60 及股价相对位置、位于几条均线上方、量比、MACD(12/26/9) DIF/DEA 多空状态，作为大模型输入。
+
+**结果窗口（非模态，可多开）：** 显示分析正文 + 红色免责声明「仅供参考，不构成投资建议」，「重新分析」重跑、「AI 设置」就地改配置。分析在后台线程 `AIWorker` 进行，不阻塞主界面；出错（未配 Key / 网络 / 鉴权失败）显示 HTTP 状态与提示。
+
+**隐私：** API Key 与接口配置只保存在本地 `stock_monitor_config.json`（`ai_provider`/`ai_base_url`/`ai_api_key`/`ai_model`），密钥输入框以密码形式显示。
 
 ---
 
@@ -242,7 +277,11 @@ stock_monitor.py
 │   ├── _macd(closes)          # 计算 DIF/DEA（EMA12/26 + DEA9）
 │   ├── conds_desc()           # 条件列表→中文描述（「且」连、「或」分支）
 │   ├── _resolve_backtest_window()  # 从序列切出回测窗口起点
-│   └── enumerate_combos()     # 硬编码枚举 50 种买卖组合（组合排行用，不随 COND_TYPES 变动）
+│   ├── enumerate_optimize_combos() # 硬编码枚举 196 种买卖组合（组合寻优用；OPT_BUY_MA/OPT_SELL_MA/OPT_COOLDOWN 网格）
+│   └── optimize_score()       # 综合评分 = 收益率 × 胜率 × min(1, 次数/3)，惩罚样本过少
+├── ai_chat(config, system, user)   # 调大模型：Anthropic /v1/messages 或 OpenAI /chat/completions，只用 urllib，出错抛异常
+│   ├── _ai_config()          # 读 config 里 ai_provider/base_url/api_key/model，缺省用 AI_DEFAULTS
+│   └── _ai_stock_context()   # 采集某股票技术面（均线/量比/MACD等）拼成中文上下文
 ├── FloatWidget                # 置顶浮窗，支持任意数量股票，每行：价格  涨跌幅
 │   ├── _rebuild_rows()        # 增删股票时重建所有行（Label 透传鼠标事件，整体可拖）
 │   ├── _apply_data()          # 更新某行数据（涨跌幅颜色跟随字体颜色设置）
@@ -253,22 +292,26 @@ stock_monitor.py
 ├── IndexHistoryWorker(QThread)# 后台线程，启动拉60日历史成交额
 ├── IndexTodayWorker(QThread)  # 后台线程，跟随刷新间隔拉当日成交额
 ├── BacktestWorker(QThread)    # 后台线程：拉日K+跑回测，signal 回主线程（按时间段命中 _backtest_kline_cache 则复用不联网；附带区间买入持有 hold_pct；注意勿用start等属性名遮蔽QThread方法）
-├── ComboWorker(QThread)       # 后台线程：拉一次日K，内存跑 enumerate_combos() 全部 50 种，emit 瘦身条目 JSON + hold_pct
+├── ComboWorker(QThread)       # 后台线程：拉一次日K，内存跑 enumerate_optimize_combos() 全部 196 种，emit 瘦身条目 JSON（含胜率/回撤/综合评分）+ hold_pct
+├── AIWorker(QThread)          # 后台线程：采集技术面 + ai_chat() 调大模型诊股，done(name, text)/error(msg)
 ├── NameLookupWorker(QThread)  # 后台线程：查股票名回填代码单元格
 ├── _ConditionsCell           # 可增删的多条件单元格：买入侧分「且/或」两组，卖出侧单组
+├── AISettingsDialog           # AI 设置窗：接口类型(Anthropic/OpenAI兼容)+base_url/api_key(密码)/model，保存到 config
+├── AIDialog                   # AI 诊股结果窗（非模态可多开）：起 AIWorker 显示分析正文+免责声明，可重新分析/开设置
 ├── AnalysisWindow             # 股票分析窗口：多行策略回测，各行配置自动持久化
 │   ├── _add_row()/_del_row()  # 增删行；_save_rows/_schedule_save 防抖落盘 config.analysis_rows
 │   ├── _run_row()             # 校验后起 BacktestWorker → 结果回 _on_result 直接开 KLineDialog
 │   ├── _record_rank()/_delete_scope()  # 收益排行：按作用域(股票+时间段)去重降序、落盘 config.rank_store（只存汇总+买卖条件，不存报告）
 │   ├── _delete_scopes_for_code()       # 删整行股票时，删该代码下所有时间段作用域
-│   ├── _run_combo()/_on_combo_done()   # 组合排行：起 ComboWorker，完成后合并 50 条进当前作用域并落盘
+│   ├── _run_combo()/_on_combo_done()   # 组合寻优：起 ComboWorker，完成后合并 196 条进当前作用域并落盘
+│   ├── _open_ai()            # 从 K线窗「AI 解读」打开 AIDialog（可多开）
 │   ├── _set_scope_note()               # 作用域备注：写入/清除 rec["note"] 并落盘
 │   ├── _on_row_scope_maybe_changed()   # 行的股票/时间段变化 → 仅更新行绑定的作用域键，不删旧排行
 │   ├── _open_leaderboard(code)/_make_rank_win()  # 打开排行窗：同股票已开则复用前置，否则新建；支持多开
 │   ├── _on_open_other()/_refresh_all_wins()      # 「其他股票」下拉 → 新开对应窗口；存储级变更刷新所有打开的窗口
 │   ├── _open_analyze()        # 打开「配置分析」窗（传入 rank_store 作用域快照，离线统计）
 │   └── _open_kline()          # 唯一非模态K线窗
-├── RankDialog                 # 收益排行窗口（可多开，关闭即销毁）：作用域下拉 + 「其他股票」下拉(新开窗口) + 收益率降序表格 + 组合排行/备注/删除/截图；点行后台重算开K线窗
+├── RankDialog                 # 收益排行窗口（可多开，关闭即销毁）：作用域下拉 + 「其他股票」下拉(新开窗口) + 排序依据下拉(综合评分/收益率/胜率/次数)+「仅≥3笔」过滤 + 8列表格 + 组合寻优/备注/删除/截图；点行后台重算开K线窗（_render 只在数据集变化时量列宽，避免196行卡顿）
 ├── AnalyzeDialog              # 配置分析窗口：勾选榜单 + 归并维度(买入/卖出/买卖组合)下拉 + 结果表(平均收益率/胜率/最好/最差/中位数)；纯本地统计，_run() 按维度分组聚合
 ├── KLineChartWidget           # K线折线（QPainter手绘）：收盘价走势+买卖点红/绿标+悬停显示单点信息
 ├── KLineDialog                # 回测结果窗口：汇总+统计+买入持有对照+K线折线+交易明细+「收益排行」按钮
@@ -282,8 +325,10 @@ stock_monitor.py
     ├── _refresh_amount_today()# 刷新间隔拉当日成交额 → _on_amount_today 更新末根
     ├── _move_row()            # ↑↓ 按钮回调：交换行内容并保存顺序
     ├── _drag_move_row()       # ⠿ 拖拽按钮回调：删除源行并插入目标位置
-    ├── _table_context_menu()  # 右键菜单：加入/移出浮窗、删除
-    └── _open_analysis()       # 打开股票分析（回测）窗口
+    ├── _table_context_menu()  # 右键菜单：加入/移出浮窗、AI 诊股、删除
+    ├── _open_analysis()       # 打开股票分析（回测）窗口
+    ├── _open_ai_settings()    # 打开 AI 设置窗
+    └── _open_ai_diagnose()    # 右键「AI 诊股」打开 AIDialog（可多开）
 ```
 
 ---
@@ -331,6 +376,10 @@ stock_monitor.py
     "vol_m": 20,
     "float_bg": "#2c3e50",
     "float_font_color": "#ffffff",
+    "ai_provider": "anthropic",
+    "ai_base_url": "",
+    "ai_api_key": "",
+    "ai_model": "",
     "t_strategy": {"600519": 1, "159995": 3},
     "analysis_rows": [
         {
@@ -348,7 +397,8 @@ stock_monitor.py
             "note": "测试组合",
             "entries": [
                 {"buy_desc": "站上5日线", "sell_desc": "跌破5日线",
-                 "trade_count": 3, "return_pct": 8.0, "total_pnl": 8000.0,
+                 "trade_count": 3, "win_rate": 66.7, "max_drawdown": 3.1,
+                 "return_pct": 8.0, "total_pnl": 8000.0, "score": 5.33,
                  "buy_conds": [{"type": "ma_above", "param": 5}],
                  "sell_conds": [{"type": "ma_below", "param": 5}]}
             ]
@@ -358,6 +408,7 @@ stock_monitor.py
 }
 ```
 
+> `ai_provider`/`ai_base_url`/`ai_api_key`/`ai_model`：AI 诊股接口配置。`ai_provider` ∈ `anthropic`/`openai`；其余留空则用默认（Anthropic `https://api.anthropic.com` + `claude-opus-5`，OpenAI `https://api.openai.com/v1` + `gpt-4o-mini`）。密钥明文存本地文件，请勿提交或外泄。
 > `t_strategy`：股票代码 → 我的做T策略下拉框索引（0 空 / 1 强势 / 2 震荡 / 3 弱势）。
 > `analysis_rows`：股票分析窗口各行配置。`mode` 为 `days`（用 `days`）或 `range`（用 `start`/`end`）；`buy`/`sell` 为条件列表，`type` ∈ 买入 `ma_above`/`cooldown`/`macd_golden`/`breakout_last_sell`、卖出 `ma_below`/`macd_death`，`param` 为日线周期或冷却天数（MACD/突破类无参数，param 忽略）。
 > `rank_store`：收益排行按作用域持久化。键为 `代码|days|N` 或 `代码|range|起|止`；值含 `name`/`meta`/可选 `hold_pct`（区间买入持有）/可选 `note`（备注）及按收益率降序的 `entries`。每条 entry 只存汇总 + `buy_conds`/`sell_conds`（**不存**报告/买卖点/序列，点行时按条件后台重算再开K线）。`rank_last_scope` 记最近查看的作用域。**只有删整行股票**才移除该代码下所有作用域；改时间段/股票不再删除旧排行。

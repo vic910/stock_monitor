@@ -46,11 +46,13 @@ import ctypes
 import datetime
 import urllib.request
 import urllib.parse
+import urllib.error
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QSpinBox, QMenu, QSystemTrayIcon, QColorDialog,
-    QComboBox, QStackedWidget, QDateEdit, QDialog, QFrame, QInputDialog
+    QComboBox, QStackedWidget, QDateEdit, QDialog, QFrame, QInputDialog,
+    QCheckBox, QTextEdit
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint, QEvent, QDate
 from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPixmap, QPainter, QPen, QBrush
@@ -669,31 +671,131 @@ def _resolve_backtest_window(series, mode, days, start):
     return dates, closes, start_idx
 
 
-# ── 「组合所有条件后排行」：枚举全部买卖组合 ──
-COMBO_BUY_MA = [5, 10, 20, 30]     # 买入「站上X日线」的候选周期
-COMBO_SELL_MA = [5, 10, 20, 30]    # 卖出「跌破X日线」的候选周期
-# 排行榜「组合排行」按钮旁常驻说明：注明本次枚举了哪些条件
-COMBO_NOTE = ("组合排行：买入[站上5/10/20/30日线、MACD金叉]（各可选 或 突破上次卖点）"
-              " × 卖出[跌破5/10/20/30日线、MACD死叉] = 50 种")
+# ── 组合寻优：在参数网格上批量回测，按目标函数（收益率/胜率/综合评分）排序，结果并入排行榜 ──
+OPT_BUY_MA = [3, 5, 10, 20, 30, 60]     # 买入「站上X日线」候选周期
+OPT_SELL_MA = [3, 5, 10, 20, 30, 60]    # 卖出「跌破X日线」候选周期
+OPT_COOLDOWN = [0, 5]                   # 买入侧冷却天数（0=不加冷却）
+# 组合寻优说明（排行窗常驻）
+OPTIMIZE_NOTE = ("组合寻优：买入[站上3/5/10/20/30/60日线、MACD金叉]"
+                 "（各可选 或突破上次卖点、各可选叠加冷却5天） × 卖出[跌破3/5/10/20/30/60日线、MACD死叉] = 196 种")
+COMBO_NOTE = OPTIMIZE_NOTE   # 兼容旧引用
 
 
-def enumerate_combos():
-    """枚举所有买卖条件组合，返回 [(buy_conds, sell_conds), ...]，共 50 种。
+def enumerate_optimize_combos():
+    """枚举寻优网格的全部买卖组合，返回 [(buy_conds, sell_conds), ...]。
 
-    主买入（能独立成立，5 个）：站上5/10/20/30日线 + MACD金叉；
-      每个主买入可选叠加「或 突破上次卖点」(OR 分支) → 10 种买入。
-    卖出（5 个）：跌破5/10/20/30日线 + MACD死叉。
-    → 10 × 5 = 50 种。突破上次卖点单独无法触发首次买入，故只作为 OR 附加项。
+    买入主条件（7）：站上3/5/10/20/30/60日线 + MACD金叉；
+      每个主条件 × 是否叠加冷却5天(2) × 是否叠加「或突破上次卖点」(2) = 28 种买入。
+    卖出（7）：跌破3/5/10/20/30/60日线 + MACD死叉。
+    → 28 × 7 = 196 种。突破上次卖点单独无法触发首次买入，故只作 OR 附加项。
     """
-    primaries = [{"type": "ma_above", "param": p} for p in COMBO_BUY_MA]
+    primaries = [{"type": "ma_above", "param": p} for p in OPT_BUY_MA]
     primaries.append({"type": "macd_golden", "param": 0})
     buys = []
     for pc in primaries:
-        buys.append([pc])                                                   # 不叠加
-        buys.append([pc, {"type": "breakout_last_sell", "param": 0}])       # 叠加「或 突破上次卖点」
-    sells = [[{"type": "ma_below", "param": p}] for p in COMBO_SELL_MA]
+        for cd in OPT_COOLDOWN:
+            base = [pc] + ([{"type": "cooldown", "param": cd}] if cd else [])
+            buys.append(base)                                                  # 不叠加突破
+            buys.append(base + [{"type": "breakout_last_sell", "param": 0}])   # 叠加「或突破上次卖点」
+    sells = [[{"type": "ma_below", "param": p}] for p in OPT_SELL_MA]
     sells.append([{"type": "macd_death", "param": 0}])
     return [(b, s) for b in buys for s in sells]
+
+
+def optimize_score(return_pct, win_rate, trade_count):
+    """综合评分：收益率 × 胜率 × min(1, 次数/3)。用交易次数因子惩罚样本过少的偶然高收益。"""
+    return return_pct * (win_rate / 100.0) * min(1.0, trade_count / 3.0)
+
+
+# ── AI 诊股：调用大模型（Anthropic Messages / OpenAI 兼容），只用标准库 urllib，无第三方依赖 ──
+AI_DEFAULTS = {
+    "anthropic": {"base_url": "https://api.anthropic.com", "model": "claude-opus-5"},
+    "openai":    {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini"},
+}
+
+AI_DIAGNOSE_SYSTEM = (
+    "你是一名严谨的A股/ETF技术分析助手。基于用户提供的均线、量比、MACD等技术指标，用简体中文分析，"
+    "结构分为：①趋势研判 ②关键均线/价位 ③操作倾向（偏多/偏空/观望，并说明理由）④风险提示。"
+    "要求：客观、简洁（400字以内），只依据给出的数据，不臆测未提供的基本面或消息面，"
+    "不承诺具体买卖点位。结尾不要写免责声明（界面已提供）。"
+)
+
+
+def _ai_config(config):
+    """读取 AI 配置，缺省用默认值。返回 (provider, base_url, api_key, model)。"""
+    provider = config.get("ai_provider") or "anthropic"
+    d = AI_DEFAULTS.get(provider, AI_DEFAULTS["anthropic"])
+    base_url = ((config.get("ai_base_url") or "").strip() or d["base_url"]).rstrip("/")
+    api_key = (config.get("ai_api_key") or "").strip()
+    model = (config.get("ai_model") or "").strip() or d["model"]
+    return provider, base_url, api_key, model
+
+
+def ai_chat(config, system, user, max_tokens=1500, timeout=60):
+    """调用配置的大模型，返回回复文本。未配置 key 或出错抛异常。"""
+    provider, base_url, api_key, model = _ai_config(config)
+    if not api_key:
+        raise Exception("尚未配置 API Key，请先点「AI 设置」填写。")
+    if provider == "openai":
+        url = f"{base_url}/chat/completions"
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {api_key}"}
+        body = {"model": model, "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}]}
+    else:
+        url = f"{base_url}/v1/messages"
+        headers = {"Content-Type": "application/json",
+                   "x-api-key": api_key,
+                   "anthropic-version": "2023-06-01"}
+        body = {"model": model, "max_tokens": max_tokens, "system": system,
+                "messages": [{"role": "user", "content": user}]}
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")[:600]
+        except Exception:
+            pass
+        raise Exception(f"HTTP {e.code}: {detail or e.reason}")
+    payload = json.loads(raw)
+    if provider == "openai":
+        return (payload["choices"][0]["message"]["content"] or "").strip() or "(空回复)"
+    # anthropic：content 为内容块列表，拼接 text 块
+    parts = [b.get("text", "") for b in payload.get("content", []) if b.get("type") == "text"]
+    return "".join(parts).strip() or "(空回复)"
+
+
+def _ai_stock_context(code):
+    """采集某股票技术面，拼成给大模型的中文上下文。返回 (name, context_text)。"""
+    (name, price, change_pct, ma5, ma10, ma20, ma30, ma60,
+     volumes, closes, vol_ratio) = fetch_stock_data(code)
+    dif, dea = _macd(closes)
+    if dif and dea:
+        macd_state = "多头(DIF>DEA)" if dif[-1] > dea[-1] else "空头(DIF<DEA)"
+        macd_line = f"MACD(12/26/9)：DIF={dif[-1]:.4f} DEA={dea[-1]:.4f}（{macd_state}）\n"
+    else:
+        macd_line = "MACD(12/26/9)：数据不足\n"
+    chg20 = ((closes[-1] / closes[-21] - 1) * 100) if len(closes) > 21 else 0.0
+
+    def rel(m):
+        return "上方" if price >= m else "下方"
+
+    above = sum(1 for m in (ma5, ma10, ma20, ma30) if price >= m)
+    ctx = (
+        f"股票代码：{code}　名称：{name}\n"
+        f"最新价：{price:.4f}　当日涨跌幅：{change_pct:+.2f}%　近20日涨幅：{chg20:+.2f}%\n"
+        f"均线：MA5={ma5:.4f}({rel(ma5)}) MA10={ma10:.4f}({rel(ma10)}) "
+        f"MA20={ma20:.4f}({rel(ma20)}) MA30={ma30:.4f}({rel(ma30)}) MA60={ma60:.4f}({rel(ma60)})\n"
+        f"股价位于 {above}/4 条均线(MA5/10/20/30)上方\n"
+        f"量比：{'--' if vol_ratio is None else f'{vol_ratio:.2f}'}\n"
+        + macd_line
+    )
+    return name, ctx
 
 
 class AmountChartWidget(QWidget):
@@ -960,9 +1062,10 @@ class KLineChartWidget(QWidget):
 class KLineDialog(QDialog):
     """K线买卖点弹窗：顶部回测汇总信息 + 中间 K线折线(标买卖点) + 底部交易明细表。"""
 
-    def __init__(self, code, name, report, parent=None, on_rank=None):
+    def __init__(self, code, name, report, parent=None, on_rank=None, on_ai=None):
         super().__init__(parent)
         self.on_rank = on_rank            # 「收益排行」按钮回调（无则不显示该按钮）
+        self.on_ai = on_ai                # 「AI 解读」按钮回调（无则不显示该按钮）
         self.setWindowTitle(f"K线买卖点 · {name}({code})")
         self.resize(820, 680)
         lay = QVBoxLayout(self)
@@ -1055,6 +1158,11 @@ class KLineDialog(QDialog):
             btn_rank = QPushButton("收益排行")
             btn_rank.clicked.connect(self.on_rank)
             btn_bar.addWidget(btn_rank, alignment=Qt.AlignmentFlag.AlignLeft)
+        if self.on_ai is not None:
+            btn_ai = QPushButton("AI 解读")
+            btn_ai.setToolTip("让大模型基于当前技术面解读这只股票")
+            btn_ai.clicked.connect(self.on_ai)
+            btn_bar.addWidget(btn_ai, alignment=Qt.AlignmentFlag.AlignLeft)
         btn_bar.addStretch()
         btn = QPushButton("关闭")
         btn.clicked.connect(self.close)
@@ -1073,13 +1181,19 @@ class RankDialog(QDialog):
     note_edited = pyqtSignal(str, str)  # 编辑备注时发出 (scope_key, 备注文本)
     open_other = pyqtSignal(str)        # 「其他股票」下拉选中时发出该作用域 scope_key（外部新开窗口）
 
+    SORT_KEYS = [("综合评分", "score"), ("收益率", "return_pct"),
+                 ("胜率", "win_rate"), ("交易次数", "trade_count")]
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("收益排行")
-        self.resize(760, 440)
+        self.resize(820, 460)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)  # 关闭即销毁，支持多开
         self.filter_code = None   # 本窗口过滤的股票代码（None=全部）
         self.view_scope = None    # 本窗口当前查看的作用域 scope_key
+        self._subtitle = ""       # 当前副标题（重排时复用）
+        self._entries = []        # 当前作用域原始条目（顺序与 rank_store 一致）
+        self._view = []           # 表格行 → 原始条目索引 的映射（排序/过滤后）
         lay = QVBoxLayout(self)
 
         top = QHBoxLayout()
@@ -1111,25 +1225,48 @@ class RankDialog(QDialog):
         self.subtitle.setWordWrap(True)
         lay.addWidget(self.subtitle)
 
+        # 排序/过滤控件：把「组合寻优」的多维排序能力带进排行窗
+        sortbar = QHBoxLayout()
+        sortbar.addWidget(QLabel("排序依据："))
+        self.sort_combo = QComboBox()
+        for label, _k in self.SORT_KEYS:
+            self.sort_combo.addItem(label)
+        self.sort_combo.currentIndexChanged.connect(self._render)
+        sortbar.addWidget(self.sort_combo)
+        self.only3 = QCheckBox("仅交易次数≥3")
+        self.only3.setToolTip("过滤只成交一两笔的偶然高收益组合")
+        self.only3.stateChanged.connect(self._render)
+        sortbar.addWidget(self.only3)
+        sortbar.addStretch()
+        lay.addLayout(sortbar)
+
         self.tbl = QTableWidget()
-        self.tbl.setColumnCount(6)
+        self.tbl.setColumnCount(8)
         self.tbl.setHorizontalHeaderLabels(
-            ["排名", "买入策略", "卖出策略", "交易次数", "收益率%", "总盈亏"])
+            ["排名", "买入策略", "卖出策略", "交易次数", "胜率%", "收益率%", "综合评分", "总盈亏"])
         self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.tbl.cellClicked.connect(lambda r, _c: self.row_activated.emit(r))
+        self.tbl.cellClicked.connect(self._on_cell_clicked)
+        # 列宽模式只设一次：买卖策略拉伸，其余交互式（固定，不随每次重排逐格测量）。
+        # 用 ResizeToContents 会在每次填表时把整列所有行都重新量一遍，196 行时切排序很卡。
+        h = self.tbl.horizontalHeader()
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for c in (0, 3, 4, 5, 6, 7):
+            h.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
+        self._need_resize = True   # 仅在数据集变化(refresh)后量一次列宽，纯排序/过滤不再量
         lay.addWidget(self.tbl)
 
         bottom = QHBoxLayout()
-        self.combo_btn = QPushButton("组合排行(50种)")
-        self.combo_btn.setToolTip(COMBO_NOTE)
+        self.combo_btn = QPushButton("组合寻优(196种)")
+        self.combo_btn.setToolTip(OPTIMIZE_NOTE)
         self.combo_btn.clicked.connect(self._on_combo_click)
         bottom.addWidget(self.combo_btn)
         self.shot_btn = QPushButton("截图")
         self.shot_btn.setToolTip("把整个排行窗口截图保存为 PNG")
         self.shot_btn.clicked.connect(self._on_shot_click)
         bottom.addWidget(self.shot_btn)
-        self.combo_note = QLabel(COMBO_NOTE)   # 常驻说明：注明本次按钮枚举了哪些条件
+        self.combo_note = QLabel(OPTIMIZE_NOTE)   # 常驻说明：注明本次按钮枚举了哪些条件
         self.combo_note.setStyleSheet("color:#555; font-size:12px;")
         self.combo_note.setWordWrap(True)
         bottom.addWidget(self.combo_note, 1)
@@ -1149,7 +1286,7 @@ class RankDialog(QDialog):
     def set_combo_running(self, running):
         """计算期间置灰按钮并显示「计算中…」，完成后恢复。"""
         self.combo_btn.setEnabled(not running)
-        self.combo_btn.setText("计算中…" if running else "组合排行(50种)")
+        self.combo_btn.setText("计算中…" if running else "组合寻优(196种)")
 
     def _on_delete_click(self):
         idx = self.scope_box.currentIndex()
@@ -1224,32 +1361,61 @@ class RankDialog(QDialog):
         self.scope_box.blockSignals(False)
 
     def refresh(self, subtitle, entries):
-        """entries：已按收益率降序排好的条目列表。"""
-        self.subtitle.setText(subtitle)
+        """存下当前作用域条目，按窗内选定的排序依据/过滤重画表格。
+        entries 顺序须与 rank_store 里一致（点行回原始索引即时重算 K线用）。"""
+        self._subtitle = subtitle
+        self._entries = list(entries or [])
+        self._need_resize = True   # 数据集变了，重画时量一次列宽
+        self._render()
+
+    def _render(self):
+        """按当前排序依据 + 「仅≥3笔」过滤重画；维护 表格行→原始索引 映射。
+        纯排序/过滤（数据集不变）不重算列宽，避免 196 行逐格测量造成卡顿。"""
+        key = self.SORT_KEYS[self.sort_combo.currentIndex()][1]
+        idxs = [i for i, e in enumerate(self._entries)
+                if not (self.only3.isChecked() and e.get("trade_count", 0) < 3)]
+        idxs.sort(key=lambda i: self._entries[i].get(key, 0), reverse=True)
+        self._view = idxs
+        self.subtitle.setText(self._subtitle)
         red, green, gray = "#e74c3c", "#27ae60", "#888888"
-        self.tbl.setRowCount(len(entries))
-        for r, e in enumerate(entries):
-            ret, pnl = e["return_pct"], e["total_pnl"]
-            ret_c = red if ret > 0 else (green if ret < 0 else gray)
-            pnl_c = red if pnl > 0 else (green if pnl < 0 else gray)
-            cells = [
-                (str(r + 1), None),
-                (e["buy_desc"], None),
-                (e["sell_desc"], None),
-                (str(e["trade_count"]), None),
-                (f"{ret:+.2f}", QColor(ret_c)),
-                (f"{pnl:+,.2f}", QColor(pnl_c)),
-            ]
-            for c, (text, fg) in enumerate(cells):
-                item = QTableWidgetItem(text)
-                if fg:
-                    item.setForeground(fg)
-                self.tbl.setItem(r, c, item)
-        h = self.tbl.horizontalHeader()
-        h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        h.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        for c in (0, 3, 4, 5):
-            h.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+
+        def color(v):
+            return QColor(red if v > 0 else (green if v < 0 else gray))
+
+        self.tbl.setUpdatesEnabled(False)   # 批量填充期间关重绘，填完一次性刷新
+        try:
+            self.tbl.setRowCount(len(idxs))
+            for r, i in enumerate(idxs):
+                e = self._entries[i]
+                ret, pnl = e["return_pct"], e["total_pnl"]
+                score = e.get("score")
+                wr = e.get("win_rate")
+                cells = [
+                    (str(r + 1), None),
+                    (e["buy_desc"], None),
+                    (e["sell_desc"], None),
+                    (str(e["trade_count"]), None),
+                    ("--" if wr is None else f"{wr:.1f}", None),
+                    (f"{ret:+.2f}", color(ret)),
+                    ("--" if score is None else f"{score:+.2f}", None if score is None else color(score)),
+                    (f"{pnl:+,.2f}", color(pnl)),
+                ]
+                for c, (text, fg) in enumerate(cells):
+                    item = QTableWidgetItem(text)
+                    if fg:
+                        item.setForeground(fg)
+                    self.tbl.setItem(r, c, item)
+            if self._need_resize:   # 只在数据集变化后量一次列宽（拉伸列 1/2 不受影响）
+                for c in (0, 3, 4, 5, 6, 7):
+                    self.tbl.resizeColumnToContents(c)
+                self._need_resize = False
+        finally:
+            self.tbl.setUpdatesEnabled(True)
+
+    def _on_cell_clicked(self, r, _c):
+        """把表格行号映射回原始条目索引再发出，避免排序/过滤后错位。"""
+        if 0 <= r < len(self._view):
+            self.row_activated.emit(self._view[r])
 
 
 class AnalyzeDialog(QDialog):
@@ -1688,9 +1854,9 @@ class BacktestWorker(QThread):
 
 
 class ComboWorker(QThread):
-    """后台线程：对某作用域(股票+时间段)只拉一次日K，在内存里跑完全部 50 种组合，一次性发回。
-    联网最多发生一次（缓存命中则一次都不发）；50 次 run_backtest 全是本地纯计算。
-    done  signal: (scope_key, name, hold_pct, entries_json)  entries 为 [{摘要+买卖条件}, ...]（不含 trades/series）
+    """后台线程：对某作用域(股票+时间段)只拉一次日K，在内存里跑完寻优网格全部 196 种组合，一次性发回。
+    联网最多发生一次（缓存命中则一次都不发）；196 次 run_backtest 全是本地纯计算。
+    done  signal: (scope_key, name, hold_pct, entries_json)  entries 含收益率/胜率/回撤/综合评分+买卖条件（不含 trades/series）
     error signal: (scope_key, msg)
     """
     done = pyqtSignal(str, str, float, str)
@@ -1707,9 +1873,9 @@ class ComboWorker(QThread):
 
     def run(self):
         try:
-            combos = enumerate_combos()
-            # 预热：组合里最大均线30、MACD等效34，取足够冗余
-            pad = max(30, 34) * 2 + 20
+            combos = enumerate_optimize_combos()
+            # 预热：网格里最大均线60、MACD等效34，取足够冗余
+            pad = max(60, 34) * 2 + 20
             today = time.strftime("%Y-%m-%d")
             if self.mode == "range":
                 cache_key = ("range", self.code, self.start_date, self.end_date, today)
@@ -1740,13 +1906,37 @@ class ComboWorker(QThread):
                 st, s = rep["stats"], rep["summary"]
                 entries.append({
                     "buy_desc": st["buy_desc"], "sell_desc": st["sell_desc"],
-                    "trade_count": st["trade_count"],
+                    "trade_count": st["trade_count"], "win_rate": st["win_rate"],
+                    "max_drawdown": st["max_drawdown"],
                     "return_pct": s["return_pct"], "total_pnl": s["total_pnl"],
+                    "score": optimize_score(s["return_pct"], st["win_rate"], st["trade_count"]),
                     "buy_conds": buy_conds, "sell_conds": sell_conds,
                 })
             self.done.emit(self.scope_key, name, hold_pct, json.dumps(entries))
         except Exception as e:
             self.error.emit(self.scope_key, str(e))
+
+
+class AIWorker(QThread):
+    """后台线程：采集技术面 + 调用大模型诊股。done(name, text) / error(msg)。"""
+    done = pyqtSignal(str, str)
+    error = pyqtSignal(str)
+
+    def __init__(self, config, code, extra_context=""):
+        super().__init__()
+        self.config = config
+        self.code = code
+        self.extra_context = extra_context
+
+    def run(self):
+        try:
+            name, ctx = _ai_stock_context(self.code)
+            if self.extra_context:
+                ctx += "\n" + self.extra_context
+            text = ai_chat(self.config, AI_DIAGNOSE_SYSTEM, ctx)
+            self.done.emit(name, text)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class NameLookupWorker(QThread):
@@ -1998,6 +2188,151 @@ class _ConditionsCell(QWidget):
         return out
 
 
+class AISettingsDialog(QDialog):
+    """AI 设置：选择接口类型（Anthropic / OpenAI 兼容）、填写 base_url / api_key / model，保存到 config。"""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.setWindowTitle("AI 设置")
+        self.resize(480, 260)
+        lay = QVBoxLayout(self)
+
+        row1 = QHBoxLayout()
+        lb0 = QLabel("接口类型：")
+        lb0.setFixedWidth(80)
+        row1.addWidget(lb0)
+        self.provider = QComboBox()
+        self.provider.addItem("Anthropic (Claude)", "anthropic")
+        self.provider.addItem("OpenAI 兼容", "openai")
+        self.provider.setCurrentIndex(0 if (config.get("ai_provider") or "anthropic") == "anthropic" else 1)
+        self.provider.currentIndexChanged.connect(self._on_provider)
+        row1.addWidget(self.provider)
+        row1.addStretch()
+        lay.addLayout(row1)
+
+        self.base_url = QLineEdit(config.get("ai_base_url", ""))
+        self.api_key = QLineEdit(config.get("ai_api_key", ""))
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.model = QLineEdit(config.get("ai_model", ""))
+        for label, w, tip in [
+            ("Base URL：", self.base_url,
+             "留空用默认。Anthropic 填到域名即可，程序自动补 /v1/messages；OpenAI兼容需含 /v1，程序补 /chat/completions"),
+            ("API Key：", self.api_key, "你的密钥，仅保存在本地配置文件 stock_monitor_config.json"),
+            ("模型：", self.model, "留空用默认。如 claude-opus-5 / gpt-4o / deepseek-chat / qwen-plus 等"),
+        ]:
+            r = QHBoxLayout()
+            lb = QLabel(label)
+            lb.setFixedWidth(80)
+            r.addWidget(lb)
+            w.setToolTip(tip)
+            r.addWidget(w)
+            lay.addLayout(r)
+
+        self.hint = QLabel()
+        self.hint.setStyleSheet("color:#888; font-size:11px;")
+        self.hint.setWordWrap(True)
+        lay.addWidget(self.hint)
+        self._on_provider()
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        ok = QPushButton("保存")
+        ok.clicked.connect(self._save)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+    def _on_provider(self):
+        p = self.provider.currentData()
+        d = AI_DEFAULTS[p]
+        self.base_url.setPlaceholderText(f"默认 {d['base_url']}")
+        self.model.setPlaceholderText(f"默认 {d['model']}")
+        if p == "anthropic":
+            self.hint.setText("Anthropic：请求 {base}/v1/messages，鉴权头 x-api-key。国内直连易超时，可填中转域名。")
+        else:
+            self.hint.setText("OpenAI兼容：请求 {base}/chat/completions，鉴权 Bearer。支持通义/DeepSeek/智谱等兼容端点。")
+
+    def _save(self):
+        self.config["ai_provider"] = self.provider.currentData()
+        self.config["ai_base_url"] = self.base_url.text().strip()
+        self.config["ai_api_key"] = self.api_key.text().strip()
+        self.config["ai_model"] = self.model.text().strip()
+        save_config(self.config)
+        self.accept()
+
+
+class AIDialog(QDialog):
+    """AI 诊股结果窗（非模态）：显示大模型对该股票技术面的分析，可重新分析 / 打开设置。"""
+
+    def __init__(self, config, code, name_hint="", extra_context="", parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.code = code
+        self.extra_context = extra_context
+        self._worker = None
+        self.setWindowTitle(f"AI 诊股 · {name_hint or code}")
+        self.resize(560, 560)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        lay = QVBoxLayout(self)
+        self.header = QLabel(f"{name_hint or ''}({code})")
+        self.header.setStyleSheet("font-weight:bold;")
+        lay.addWidget(self.header)
+        self.body = QTextEdit()
+        self.body.setReadOnly(True)
+        lay.addWidget(self.body, stretch=1)
+        disclaimer = QLabel("以上为AI基于技术指标的分析，仅供参考，不构成投资建议。")
+        disclaimer.setStyleSheet("color:#c0392b; font-size:11px;")
+        disclaimer.setWordWrap(True)
+        lay.addWidget(disclaimer)
+
+        btns = QHBoxLayout()
+        self.btn_retry = QPushButton("重新分析")
+        self.btn_retry.clicked.connect(self.start)
+        btn_set = QPushButton("AI 设置")
+        btn_set.clicked.connect(self._open_settings)
+        btns.addWidget(self.btn_retry)
+        btns.addWidget(btn_set)
+        btns.addStretch()
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.close)
+        btns.addWidget(btn_close)
+        lay.addLayout(btns)
+        self.start()
+
+    def start(self):
+        if self._worker is not None:
+            return
+        self.body.setPlainText("正在分析，请稍候…（首次调用大模型可能需要数秒到数十秒）")
+        self.btn_retry.setEnabled(False)
+        self._worker = AIWorker(self.config, self.code, self.extra_context)
+        self._worker.done.connect(self._on_done)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_done(self, name, text):
+        if name:
+            self.header.setText(f"{name}({self.code})")
+            self.setWindowTitle(f"AI 诊股 · {name}")
+        self.body.setPlainText(text)
+
+    def _on_error(self, msg):
+        self.body.setPlainText(
+            f"分析失败：{msg}\n\n"
+            "请检查「AI 设置」中的接口类型、Base URL、API Key、模型是否正确，以及网络/中转是否可用。")
+
+    def _on_finished(self):
+        self._worker = None
+        self.btn_retry.setEnabled(True)
+
+    def _open_settings(self):
+        AISettingsDialog(self.config, self).exec()
+
+
 class AnalysisWindow(QWidget):
     """股票分析（回测）窗口：多行表格，每行独立的买入/卖出多条件策略回测。"""
 
@@ -2019,6 +2354,7 @@ class AnalysisWindow(QWidget):
         self._combo_win = None     # 发起「组合排行」的那个排行窗口（用于回收 loading 状态）
         self._open_worker = None   # 点排行某行时即时重算该组合的后台线程
         self._analyze_win = None   # 「分析配置」窗口（非模态单例）
+        self._ai_wins = []            # AI 诊股窗口（可多开）
         self._save_timer = QTimer(self)      # 变更防抖：多次快速改动只落盘一次
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(400)
@@ -2315,8 +2651,10 @@ class AnalysisWindow(QWidget):
         entries = [e for e in rec["entries"] if (e["buy_desc"], e["sell_desc"]) != ck]  # 去重
         entries.append({
             "buy_desc": st["buy_desc"], "sell_desc": st["sell_desc"],
-            "trade_count": st["trade_count"],
+            "trade_count": st["trade_count"], "win_rate": st["win_rate"],
+            "max_drawdown": st["max_drawdown"],
             "return_pct": s["return_pct"], "total_pnl": s["total_pnl"],
+            "score": optimize_score(s["return_pct"], st["win_rate"], st["trade_count"]),
             "buy_conds": report.get("buy_conds", []),
             "sell_conds": report.get("sell_conds", []),
         })
@@ -2431,7 +2769,7 @@ class AnalysisWindow(QWidget):
             lambda _rid, _code, msg: QMessageBox.warning(self, "打开失败", msg))
         self._open_worker.start()
 
-    # ── 组合排行：枚举全部 50 种买卖组合、跑回测、并入该作用域榜单 ──
+    # ── 组合寻优：枚举全部 196 种买卖组合、跑回测、并入该作用域榜单 ──
     def _run_combo(self, w, scope_key):
         rec = self._rank_store.get(scope_key)
         if not rec:
@@ -2506,11 +2844,20 @@ class AnalysisWindow(QWidget):
         if self._kline_win is not None:
             self._kline_win.close()
         self._kline_win = KLineDialog(code, name, report, self,
-                                      on_rank=lambda checked=False, c=code: self._open_leaderboard(c))
+                                      on_rank=lambda checked=False, c=code: self._open_leaderboard(c),
+                                      on_ai=lambda checked=False, c=code, n=name: self._open_ai(c, n))
         self._kline_win.finished.connect(lambda _r: setattr(self, "_kline_win", None))
         self._kline_win.show()
         self._kline_win.raise_()
         self._kline_win.activateWindow()
+
+    def _open_ai(self, code, name=""):
+        win = AIDialog(self.config, code, name, parent=self)
+        win.finished.connect(lambda _r, ww=win: self._ai_wins.remove(ww) if ww in self._ai_wins else None)
+        self._ai_wins.append(win)
+        win.show()
+        win.raise_()
+        win.activateWindow()
 
 
 class MainWindow(QMainWindow):
@@ -2521,6 +2868,7 @@ class MainWindow(QMainWindow):
         self.config = load_config()
         self.worker = None
         self._analysis_win = None       # 股票分析（回测）窗口
+        self._ai_wins = []              # AI 诊股窗口（可多开）
         self._hist_worker = None       # 历史成交额（启动拉一次）
         self._today_worker = None      # 当日成交额（跟随刷新间隔）
         self._amount_series = []       # 内存中的总成交额序列 [(日期, 元), ...] 升序
@@ -2591,6 +2939,11 @@ class MainWindow(QMainWindow):
         self.analysis_btn.setFixedWidth(80)
         self.analysis_btn.clicked.connect(self._open_analysis)
         top.addWidget(self.analysis_btn)
+        self.ai_btn = QPushButton("AI 设置")
+        self.ai_btn.setFixedWidth(80)
+        self.ai_btn.setToolTip("配置 AI 诊股用的接口类型 / 密钥 / 模型")
+        self.ai_btn.clicked.connect(self._open_ai_settings)
+        top.addWidget(self.ai_btn)
         layout.addLayout(top)
 
         # 数据表格，列：代码/名称/最新价/涨跌幅/量比/均线状态/趋势/活跃度/趋势做T策略/我的做T策略/排序
@@ -2665,6 +3018,17 @@ class MainWindow(QMainWindow):
         self._analysis_win.show()
         self._analysis_win.raise_()
         self._analysis_win.activateWindow()
+
+    def _open_ai_settings(self):
+        AISettingsDialog(self.config, self).exec()
+
+    def _open_ai_diagnose(self, code, name=""):
+        win = AIDialog(self.config, code, name, parent=self)
+        win.finished.connect(lambda _r, ww=win: self._ai_wins.remove(ww) if ww in self._ai_wins else None)
+        self._ai_wins.append(win)
+        win.show()
+        win.raise_()
+        win.activateWindow()
 
     def _tray_show(self):
         self.showNormal()
@@ -3116,9 +3480,13 @@ class MainWindow(QMainWindow):
         else:
             act_pin = menu.addAction(f"加入浮窗：{name}({code})")
         menu.addSeparator()
+        act_ai = menu.addAction(f"AI 诊股：{name}")
+        menu.addSeparator()
         act_del = menu.addAction(f"删除 {code}")
         act = menu.exec(QCursor.pos())
-        if act == act_pin:
+        if act == act_ai:
+            self._open_ai_diagnose(code, name)
+        elif act == act_pin:
             if in_float:
                 self._float_win.remove_stock(code)
                 if not self._float_win._codes:
