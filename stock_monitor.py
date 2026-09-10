@@ -1654,11 +1654,11 @@ class AnalyzeDialog(QDialog):
 
 
 class FloatWidget(QWidget):
-    """常驻最顶层浮窗，支持任意数量股票，每行：价格  涨跌幅
+    """常驻最顶层浮窗，支持任意数量股票，每行：做T信号  价格  涨跌幅  量比
     内部状态：
       _codes  : 有序列表，决定行的显示顺序
-      _data   : code → (price, change_pct)，用于重建行时恢复数据
-      _rows   : code → (price_lbl, chg_lbl)，当前显示的 Label 引用
+      _data   : code → (price, change_pct, vol_ratio, t_signal)，用于重建行时恢复数据
+      _rows   : code → (sig_lbl, price_lbl, chg_lbl, vol_lbl)，当前显示的 Label 引用
     """
 
     color_changed = pyqtSignal(str)
@@ -1726,6 +1726,10 @@ class FloatWidget(QWidget):
         for code in self._codes:
             row = QHBoxLayout()
             row.setSpacing(6)
+            sig_lbl = QLabel("-")   # 实时做T信号：低吸↑ / 高抛↓ / 持有- ，紧贴价格左侧
+            sig_lbl.setFont(self._make_font(10, bold=True))
+            sig_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            sig_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             price_lbl = QLabel("--")
             price_lbl.setFont(self._make_font(9))
             price_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -1738,21 +1742,24 @@ class FloatWidget(QWidget):
             vol_lbl.setFont(self._make_font(9))
             vol_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             vol_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            row.addWidget(sig_lbl)
             row.addWidget(price_lbl)
             row.addWidget(chg_lbl)
             row.addWidget(vol_lbl)
             self._main_layout.addLayout(row)
-            self._rows[code] = (price_lbl, chg_lbl, vol_lbl)
+            self._rows[code] = (sig_lbl, price_lbl, chg_lbl, vol_lbl)
             if code in self._data:
                 self._apply_data(code, *self._data[code])
 
         self.adjustSize()
 
-    def _apply_data(self, code, price, change_pct, vol_ratio=None):
-        """把数据写入对应行的 Label（价格 + 涨跌幅 + 量比）"""
+    def _apply_data(self, code, price, change_pct, vol_ratio=None, t_signal=None):
+        """把数据写入对应行的 Label（做T信号 + 价格 + 涨跌幅 + 量比）"""
         if code not in self._rows:
             return
-        price_lbl, chg_lbl, vol_lbl = self._rows[code]
+        sig_lbl, price_lbl, chg_lbl, vol_lbl = self._rows[code]
+        # 实时做T信号符号：低吸↑ / 高抛↓ / 持有及无数据- （不上色，跟随浮窗字体色）
+        sig_lbl.setText({"低吸": "↑", "高抛": "↓"}.get(t_signal, "-"))
         price_lbl.setText(f"{price:.4f}")
         fc = self._font_color
         chg_lbl.setText(f"{change_pct:+.2f}%")
@@ -1776,9 +1783,9 @@ class FloatWidget(QWidget):
         self._data.pop(code, None)
         self._rebuild_rows()
 
-    def update_stock(self, code, price, change_pct, vol_ratio=None):
-        self._data[code] = (price, change_pct, vol_ratio)
-        self._apply_data(code, price, change_pct, vol_ratio)
+    def update_stock(self, code, price, change_pct, vol_ratio=None, t_signal=None):
+        self._data[code] = (price, change_pct, vol_ratio, t_signal)
+        self._apply_data(code, price, change_pct, vol_ratio, t_signal)
         self.adjustSize()
 
     def has_stock(self, code):
@@ -3560,9 +3567,9 @@ class MainWindow(QMainWindow):
             self.table.item(r, 9).setToolTip(t_rt_tip)   # 实时做T：判定依据全在悬停里
             self.table.item(r, 0).setBackground(bg)
 
-            # 同步浮窗
+            # 同步浮窗（含实时做T信号符号）
             if self._float_win.has_stock(code):
-                self._float_win.update_stock(code, price, change_pct, vol_ratio_rt)
+                self._float_win.update_stock(code, price, change_pct, vol_ratio_rt, t_rt_text)
             break
 
     def _table_context_menu(self, pos):

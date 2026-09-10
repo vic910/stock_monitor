@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="实时做T">
+<title>股价 · 实时做T</title>
+<style>
+  :root{
+    --bg:#0e1320; --card:#191f2e; --card2:#212a3d;
+    --fg:#e8ecf3; --dim:#8a94a6;
+    --red:#ff5a63; --green:#33d17a; --gray:#8a94a6; --accent:#4a90d9;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;
+    padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+    -webkit-text-size-adjust:100%;
+  }
+  header{
+    position:sticky; top:0; z-index:5;
+    background:linear-gradient(180deg,var(--bg) 70%,transparent);
+    padding:14px 16px 8px;
+  }
+  .title{font-size:20px; font-weight:700; letter-spacing:.5px;}
+  .sub{margin-top:3px; font-size:12px; color:var(--dim); display:flex; gap:8px; align-items:center;}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--gray);display:inline-block;}
+  .dot.on{background:var(--green);box-shadow:0 0 6px var(--green);}
+  main{padding:4px 12px 12px;}
+  .row{
+    background:var(--card); border-radius:14px; margin:8px 0;
+    padding:14px 16px; display:grid; grid-template-columns:1fr auto auto; gap:12px;
+    align-items:center;
+  }
+  .name{min-width:0;}
+  .name .nm{font-size:16px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .name .cd{font-size:11px; color:var(--dim); margin-top:2px;}
+  .price{text-align:right;}
+  .price .pr{font-size:20px; font-weight:700; font-variant-numeric:tabular-nums;}
+  .price .ch{font-size:12px; margin-top:2px; font-variant-numeric:tabular-nums;}
+  .sigcol{display:flex; flex-direction:column; gap:5px; min-width:82px;}
+  .sig{
+    text-align:center; font-size:15px; font-weight:700;
+    padding:8px 10px; border-radius:10px; background:var(--card2);
+  }
+  .lv{
+    display:flex; flex-direction:column; align-items:center; line-height:1.5;
+    font-size:11px; font-weight:600; font-variant-numeric:tabular-nums;
+  }
+  .up{color:var(--red);} .down{color:var(--green);} .flat{color:var(--gray);}
+  .detail{
+    grid-column:1/-1; margin-top:6px; padding-top:10px;
+    border-top:1px solid rgba(255,255,255,.07);
+    font-size:12px; color:var(--dim); line-height:1.7; display:none;
+  }
+  .row.open .detail{display:block;}
+  .detail .kv{display:inline-block; min-width:50%;}
+  .rm{
+    margin-top:8px; color:var(--red); font-size:12px; border:1px solid rgba(255,90,99,.4);
+    background:transparent; padding:5px 12px; border-radius:8px;
+  }
+  .manage{padding:6px 12px 18px; display:flex; gap:8px;}
+  .manage input{
+    flex:1; background:var(--card); border:1px solid rgba(255,255,255,.1);
+    color:var(--fg); font-size:15px; padding:11px 14px; border-radius:10px; outline:none;
+  }
+  .manage button{
+    background:var(--accent); color:#fff; border:none; font-size:15px; font-weight:600;
+    padding:0 18px; border-radius:10px;
+  }
+  .empty{text-align:center; color:var(--dim); padding:40px 20px; font-size:14px; line-height:1.8;}
+  .tips{padding:0 16px 30px; color:var(--dim); font-size:11px; line-height:1.7;}
+  .err{color:var(--red);}
+</style>
+</head>
+<body>
+<header>
+  <div class="title">股价 · 实时做T</div>
+  <div class="sub">
+    <span class="dot" id="tdDot"></span>
+    <span id="status">加载中…</span>
+    <span id="updated"></span>
+  </div>
+</header>
+
+<main id="list"></main>
+
+<div class="manage">
+  <input id="codeInput" inputmode="numeric" placeholder="输入代码，如 600000 / 159995 / 300750">
+  <button id="addBtn">添加</button>
+</div>
+
+<div class="tips">
+  低吸 = 回踩到均价下方/日内低位、缩量企稳且未破位放量（红）<br>
+  高抛 = 冲高到均价上方/日内高位、放量滞涨（绿）　持有/非交易时段 = 灰<br>
+  点某一行可展开均价、参考买卖价等依据。数据来自腾讯行情，仅供参考。
+</div>
+
+<script>
+"use strict";
+
+const LS_STOCKS = "tstocks_v1";
+const REFRESH_MS = 10000;
+
+// ── 股票列表（localStorage 持久化）────────────────────────────
+function loadStocks(){
+  try{
+    const a = JSON.parse(localStorage.getItem(LS_STOCKS) || "null");
+    if(Array.isArray(a) && a.length) return a;
+  }catch(e){}
+  return ["sz159995", "sh513050", "sh513120", "sz159131", "sh510300", "sh562500", "hk00700"];
+}
+function saveStocks(a){ try{ localStorage.setItem(LS_STOCKS, JSON.stringify(a)); }catch(e){} }
+let stocks = loadStocks();
+
+// 输入代码 → 腾讯 secid（带 sh/sz/bj 前缀）
+function toSecid(input){
+  let c = (input || "").trim().toLowerCase();
+  if(/^(sh|sz|bj)\d{6}$/.test(c)) return c;   // 已带 A股前缀
+  if(/^hk\d{4,5}$/.test(c)) return c;          // 已带港股前缀
+  c = c.replace(/\D/g, "");
+  if(c.length === 5) return "hk" + c;          // 港股 5 位（如 00700）
+  if(c.length === 4) return "hk0" + c;         // 港股 4 位补零
+  if(c.length !== 6) return null;
+  let mk;
+  if(/^(6|5|9)/.test(c)) mk = "sh";
+  else if(/^(4|8)/.test(c)) mk = "bj";
+  else mk = "sz";
+  return mk + c;
+}
+
+// 本地日期 YYYY-MM-DD（不能用 toISOString，那是 UTC，东八区凌晨会跨日错位）
+function todayStr(){
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+// ── 交易时段（用手机本地时间，中国用户即东八区）──────────────
+function isTradingTime(){
+  const d = new Date();
+  const wd = d.getDay();               // 0=周日 6=周六
+  if(wd === 0 || wd === 6) return false;
+  const t = d.getHours() * 60 + d.getMinutes();
+  return (t >= 570 && t <= 690) || (t >= 780 && t <= 900);
+}
+
+// ── 实时做T信号（复刻桌面版 compute_t_signal）─────────────────
+// 三态信号（低吸/高抛/持有）仅盘中给；买卖点参考价只要有当日数据就返回（收盘后也可看今日区间）
+function computeTSignal(price, ma10, intr){
+  if(!intr) return {text:"-", cls:"flat", tip:"无当日实时数据", buy:null, sell:null};
+  const high = intr.high, low = intr.low, prev = intr.prev_close;
+  const amount = intr.amount, volume = intr.volume, vr = intr.vol_ratio;
+  if(!high || !low || high <= 0 || low <= 0 || high < low)
+    return {text:"-", cls:"flat", tip:"当日高低价数据不全", buy:null, sell:null};
+
+  const avg = (amount && volume && volume > 0) ? amount / volume : (high + low + price) / 3;
+  const denom = (prev && prev > 0) ? prev : avg;
+  const amplitude = denom > 0 ? (high - low) / denom : 0;
+  const k = Math.max(0.005, Math.min(0.03, amplitude * 0.35));
+  const dev = avg > 0 ? (price - avg) / avg : 0;
+  const pos = high > low ? (price - low) / (high - low) : 0.5;
+  const bullish = ma10 ? (price >= ma10) : true;
+  const buyRef = avg * (1 - k), sellRef = avg * (1 + k);
+
+  const priceLow  = dev <= -k || pos <= 0.20;
+  const priceHigh = dev >= k  || pos >= 0.80;
+  const steady = price > low * 1.001;
+  const stall  = price < high * 0.999;
+  const dump   = pos <= 0.10 && vr != null && vr >= 2.0;
+
+  const trading = isTradingTime();
+  let text, cls;
+  if(!trading)                          { text = "-";    cls = "flat"; }
+  else if(priceLow && steady && !dump)  { text = "低吸"; cls = "up";   }
+  else if(priceHigh && stall)           { text = "高抛"; cls = "down"; }
+  else                                  { text = "持有"; cls = "flat"; }
+
+  const tip =
+    (trading ? "" : "非交易时段（信号仅盘中计算，买卖点为今日参考区间）\n") +
+    `现价 ${price.toFixed(3)} ｜ 均价 ${avg.toFixed(3)}（dev ${(dev*100).toFixed(1)}%）\n` +
+    `日内位置 ${(pos*100).toFixed(0)}% ｜ 振幅 ${(amplitude*100).toFixed(1)}% ｜ k ±${(k*100).toFixed(1)}%\n` +
+    `量比 ${vr!=null?vr.toFixed(2):"--"} ｜ ${bullish?"价≥MA10 多头":"价<MA10 弱势"}\n` +
+    `参考买入 ≤${buyRef.toFixed(3)} ｜ 高抛目标 ~${sellRef.toFixed(3)}`;
+
+  return {text, cls, tip, buy:buyRef, sell:sellRef};
+}
+
+// ── 拉实时行情（批量，gbk 解码）───────────────────────────────
+async function fetchQuotes(secids){
+  const url = "https://qt.gtimg.cn/q=" + secids.join(",");
+  const buf = await (await fetch(url, {cache:"no-store"})).arrayBuffer();
+  const text = new TextDecoder("gbk").decode(buf);
+  const map = {};
+  const re = /v_(\w+)="([^"]*)"/g;
+  let m;
+  while((m = re.exec(text)) !== null){
+    const f = m[2].split("~");
+    const num = i => { const v = parseFloat(f[i]); return isNaN(v) ? null : v; };
+    const isHK = m[1].startsWith("hk");
+    const rawVol = num(6), rawAmt = num(37);   // A股:量=手/额=万元；港股:量=股/额=元
+    map[m[1]] = {
+      name: f[1] || m[1],
+      price: num(3),
+      change_pct: num(32),
+      intr: {
+        open: num(5), prev_close: num(4), high: num(33), low: num(34),
+        volume: rawVol != null ? (isHK ? rawVol : rawVol * 100) : null,
+        amount: rawAmt != null ? (isHK ? rawAmt : rawAmt * 10000) : null,
+        vol_ratio: isHK ? null : num(49)        // 港股 f[49] 非量比，置空
+      }
+    };
+  }
+  return map;
+}
+
+// ── 日K → MA10（当天缓存，隔日才重拉）─────────────────────────
+async function fetchMA10(secid, price){
+  const today = todayStr();
+  const key = "kline_" + secid;
+  let closes = null, lastDate = null;
+  try{
+    const c = JSON.parse(localStorage.getItem(key) || "null");
+    if(c && c.date === today && Array.isArray(c.closes)){ closes = c.closes; lastDate = c.lastDate; }
+  }catch(e){}
+  if(!closes){
+    const url = "https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get?param=" + secid + ",day,,,20,qfq";
+    const txt = await (await fetch(url, {cache:"no-store"})).text();
+    const json = JSON.parse(txt.slice(txt.indexOf("{")));
+    const sd = (json.data || {})[secid] || {};
+    const kl = sd.qfqday || sd.day || [];
+    closes = kl.map(k => parseFloat(k[2])).filter(v => !isNaN(v));
+    lastDate = kl.length ? kl[kl.length - 1][0] : null;
+    if(closes.length){ try{ localStorage.setItem(key, JSON.stringify({date:today, lastDate, closes})); }catch(e){} }
+  }
+  if(!closes.length) return null;
+  const arr = closes.slice();
+  if(price != null){
+    if(lastDate === today) arr[arr.length - 1] = price;   // 覆盖当天动态收盘
+    else arr.push(price);                                  // 今日新增
+  }
+  const last10 = arr.slice(-10);
+  return last10.reduce((a, b) => a + b, 0) / last10.length;
+}
+
+// ── 渲染 ──────────────────────────────────────────────────────
+function fmt(v){ return v >= 100 ? v.toFixed(2) : v.toFixed(3); }
+
+const listEl = document.getElementById("list");
+const openSet = new Set();   // 记住展开的行
+
+function render(items){
+  if(!stocks.length){
+    listEl.innerHTML = '<div class="empty">还没有添加股票<br>在下面输入代码后点「添加」</div>';
+    return;
+  }
+  const html = items.map(it => {
+    if(it.error){
+      return `<div class="row"><div class="name"><div class="nm">${it.secid.slice(2)}</div>` +
+             `<div class="cd err">获取失败</div></div><div class="price"></div>` +
+             `<div class="sig flat" data-sec="${it.secid}">-</div></div>`;
+    }
+    const chCls = it.change_pct > 0 ? "up" : (it.change_pct < 0 ? "down" : "flat");
+    const chTxt = it.change_pct != null ? (it.change_pct>=0?"+":"") + it.change_pct.toFixed(2) + "%" : "--";
+    const open = openSet.has(it.secid) ? " open" : "";
+    const bs = it.sig.buy != null
+      ? `<div class="lv"><span class="up">买 ${fmt(it.sig.buy)}</span><span class="down">卖 ${fmt(it.sig.sell)}</span></div>`
+      : "";
+    return `<div class="row${open}" data-sec="${it.secid}">
+      <div class="name"><div class="nm">${it.name}</div><div class="cd">${it.secid.slice(2)}</div></div>
+      <div class="price"><div class="pr ${chCls}">${it.price!=null?fmt(it.price):"--"}</div>
+        <div class="ch ${chCls}">${chTxt}</div></div>
+      <div class="sigcol">
+        <div class="sig ${it.sig.cls}">${it.sig.text}</div>
+        ${bs}
+      </div>
+      <div class="detail">${it.sig.tip.replace(/\n/g,"<br>")}
+        <br><button class="rm" data-rm="${it.secid}">移除</button></div>
+    </div>`;
+  }).join("");
+  listEl.innerHTML = html;
+}
+
+// ── 一轮刷新 ──────────────────────────────────────────────────
+let busy = false;
+async function tick(){
+  if(busy) return;
+  busy = true;
+  const dot = document.getElementById("tdDot");
+  const statusEl = document.getElementById("status");
+  const updEl = document.getElementById("updated");
+  const trading = isTradingTime();
+  dot.className = "dot" + (trading ? " on" : "");
+  statusEl.textContent = trading ? "交易中" : "非交易时段";
+  try{
+    if(stocks.length){
+      const quotes = await fetchQuotes(stocks);
+      const items = [];
+      for(const secid of stocks){
+        const q = quotes[secid];
+        if(!q || q.price == null){ items.push({secid, error:true}); continue; }
+        let ma10 = null;
+        try{ ma10 = await fetchMA10(secid, q.price); }catch(e){ ma10 = null; }
+        items.push({
+          secid, name:q.name, price:q.price, change_pct:q.change_pct,
+          sig: computeTSignal(q.price, ma10, q.intr)
+        });
+      }
+      render(items);
+    }else{
+      render([]);
+    }
+    const t = new Date();
+    updEl.textContent = "更新 " + t.toTimeString().slice(0,8);
+  }catch(e){
+    document.getElementById("updated").innerHTML = '<span class="err">网络/接口异常</span>';
+  }finally{
+    busy = false;
+  }
+}
+
+// ── 交互：展开详情 / 移除 / 添加 ──────────────────────────────
+listEl.addEventListener("click", e => {
+  const rm = e.target.closest("[data-rm]");
+  if(rm){
+    e.stopPropagation();
+    const sec = rm.getAttribute("data-rm");
+    stocks = stocks.filter(s => s !== sec);
+    saveStocks(stocks);
+    openSet.delete(sec);
+    tick();
+    return;
+  }
+  const row = e.target.closest(".row[data-sec]");
+  if(row){
+    const sec = row.getAttribute("data-sec");
+    if(openSet.has(sec)) openSet.delete(sec); else openSet.add(sec);
+    row.classList.toggle("open");
+  }
+});
+
+function addStock(){
+  const inp = document.getElementById("codeInput");
+  const sec = toSecid(inp.value);
+  if(!sec){ inp.value = ""; inp.placeholder = "代码无效，请输 6 位数字"; return; }
+  if(!stocks.includes(sec)){ stocks.push(sec); saveStocks(stocks); }
+  inp.value = "";
+  tick();
+}
+document.getElementById("addBtn").addEventListener("click", addStock);
+document.getElementById("codeInput").addEventListener("keydown", e => { if(e.key === "Enter") addStock(); });
+
+// ── 启动 ──────────────────────────────────────────────────────
+tick();
+setInterval(tick, REFRESH_MS);
+</script>
+</body>
+</html>
