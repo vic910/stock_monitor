@@ -432,6 +432,71 @@ def compute_t_signal(price, ma10, intraday):
     return "持有", GRAY, _detail("实时做T：持有区（未触发高抛/低吸）")
 
 
+def compute_t_signal_v2(price, ma10, change_pct, intraday):
+    """实时做T v2（Phase 1）→ (text, color_hex, tooltip)。
+
+    在 v1（均价中枢+dev+pos+企稳/滞涨+破位放量否决）基础上叠加三层增强：
+      ① 涨跌停安全阀：涨幅≥+9% 高位持有(不高抛卖飞)、跌幅≤-9% 低位观望(不低吸接刀)
+      ② 趋势门控：仅强势(价≥MA10)才给低吸，弱势回踩不再抄底
+      ③ BIAS 乖离率：离 MA10 过远(≥+6% 超买)否决低吸；超买+滞涨可触发高抛
+    买卖参考价与 v1 相同（中枢没变），仅三态判定不同。数据全现成，零新接口。
+    """
+    GRAY, RED, GREEN, ORANGE = "#888888", "#e74c3c", "#27ae60", "#e67e22"
+    if not is_trading_time():
+        return "--", GRAY, "实时做T2：非交易时段（仅盘中 9:30–11:30 / 13:00–15:00 计算）"
+    if not intraday:
+        return "--", GRAY, "实时做T2：无当日实时数据"
+
+    high = intraday.get("high"); low = intraday.get("low")
+    prev = intraday.get("prev_close")
+    amount = intraday.get("amount"); volume = intraday.get("volume")
+    vr = intraday.get("vol_ratio")
+    if not high or not low or high <= 0 or low <= 0 or high < low:
+        return "--", GRAY, "实时做T2：当日高低价数据不全"
+
+    avg = amount / volume if (amount and volume and volume > 0) else (high + low + price) / 3
+    denom = prev if (prev and prev > 0) else avg
+    amplitude = (high - low) / denom if denom > 0 else 0.0
+    k = max(0.005, min(0.03, amplitude * 0.35))
+    dev = (price - avg) / avg if avg > 0 else 0.0
+    pos = (price - low) / (high - low) if high > low else 0.5
+    bias10 = (price - ma10) / ma10 if ma10 else 0.0
+    strong = (price >= ma10) if ma10 else True
+    buy_ref = avg * (1 - k)
+    sell_ref = avg * (1 + k)
+
+    def _detail(head):
+        return "\n".join([
+            head,
+            f"现价 {price:.3f} ｜ 均价 {avg:.3f}（dev {dev*100:+.1f}%）",
+            f"日内位置 {pos*100:.0f}% ｜ 振幅 {amplitude*100:.1f}% ｜ 阈值k ±{k*100:.1f}%",
+            f"BIAS10 {bias10*100:+.1f}% ｜ {'强势 价≥MA10' if strong else '弱势 价<MA10'} ｜ 涨跌 {change_pct:+.2f}%",
+            f"参考买入 ≤{buy_ref:.3f} ｜ 高抛目标 ~{sell_ref:.3f}",
+        ])
+
+    # ① 涨跌停安全阀（门控，最高优先）
+    if change_pct is not None and change_pct >= 9.0:
+        return "高位持有", ORANGE, _detail("实时做T2：涨幅≥9%，高位持有（不高抛，避免卖飞）")
+    if change_pct is not None and change_pct <= -9.0:
+        return "低位观望", ORANGE, _detail("实时做T2：跌幅≤-9%，低位观望（不低吸，避免接刀）")
+
+    price_low  = dev <= -k or pos <= 0.20
+    price_high = dev >= k or pos >= 0.80 or bias10 >= 0.06   # ③ 超买也可高抛
+    steady = price > low * 1.001
+    stall  = price < high * 0.999
+    dump   = (pos <= 0.10) and (vr is not None and vr >= 2.0)
+
+    # 低吸：v1 条件 + ② 趋势门控（强势）+ ③ BIAS 不过高（非追高假回踩）
+    buy_ok = price_low and steady and not dump and strong and bias10 <= 0.06
+    sell_ok = price_high and stall
+
+    if buy_ok:
+        return "低吸", RED, _detail("实时做T2：低吸区（强势回踩、未破位放量、未超买）")
+    if sell_ok:
+        return "高抛", GREEN, _detail("实时做T2：高抛区（冲高滞涨 / 超买）")
+    return "持有", GRAY, _detail("实时做T2：持有区（未触发高抛/低吸）")
+
+
 def _fetch_kline_daily_tencent(tc, start="", end="", count=320):
     """腾讯K线（带日期）：tc → [(date, close), ...] 升序，取不到返回 None。
     param 位置: code,period,start,end,count,fq —— 传 start/end(YYYY-MM-DD)拉区间，
@@ -3041,20 +3106,21 @@ class MainWindow(QMainWindow):
         top.addWidget(self.ai_btn)
         layout.addLayout(top)
 
-        # 数据表格，列：代码/名称/最新价/涨跌幅/量比/均线状态/趋势/活跃度/趋势做T策略/实时做T/我的做T策略/排序
+        # 数据表格，列：代码/名称/最新价/涨跌幅/量比/均线状态/趋势/活跃度/趋势做T策略/实时做T/实时做T2/我的做T策略/排序
         self.table = QTableWidget()
-        self.table.setColumnCount(12)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "量比", "均线状态", "趋势", "活跃度(N/M)", "趋势做T策略", "实时做T", "我的做T策略", "排序"])
+        self.table.setColumnCount(13)
+        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "量比", "均线状态", "趋势", "活跃度(N/M)", "趋势做T策略", "实时做T", "实时做T2", "我的做T策略", "排序"])
         h = self.table.horizontalHeader()
-        for i in range(12):
+        for i in range(13):
             h.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         tooltips = {
             4: "量比 = 当日每分钟均量 / 过去5日每分钟均量\n>2 放量(红) | 1~2 正常(灰) | <1 缩量(绿)",
             6: "趋势（算法4）：综合均线位置(40%)、MA20斜率(30%)、价格结构(30%)加权评分\n强势↑ ≥0.85 | 偏多↗ 0.60~0.85 | 震荡→ 0.40~0.60 | 偏空↘ 0.15~0.40 | 弱势↓ <0.15",
             7: "活跃度 = N日均量 / M日均量\n≥2.0x 明显放量(红) | 1.2~2.0x 轻微放量(橙) | 1.0~1.2x 正常(灰) | <1.0x 缩量(绿)",
             8: "趋势做T策略（自动）：股价 ≥ MA10 → 积极买进(红)\n股价 < MA10 → 积极卖出(绿)",
-            9: "实时做T（盘中买卖点）：以当日均价为中枢\n低吸(红)：回踩到均价下方/日内低位、缩量企稳且未破位放量\n高抛(绿)：冲高到均价上方/日内高位且放量滞涨\n持有(灰)：未触发 | -- 非交易时段或无数据\n悬停单元格看参考价与判定依据",
-            10: "我的做T策略：手动下拉选择\n开盘回踩买进(强势,红) | 拉高卖出下跌买入(震荡分歧,黑) | 开盘拉高卖出(弱势,绿)",
+            9: "实时做T（v1，盘中买卖点）：以当日均价为中枢\n低吸(红)：回踩到均价下方/日内低位、缩量企稳且未破位放量\n高抛(绿)：冲高到均价上方/日内高位且放量滞涨\n持有(灰)：未触发 | -- 非交易时段或无数据\n悬停单元格看参考价与判定依据",
+            10: "实时做T2（v2，Phase1增强）：在 v1 上加三层过滤\n① 涨跌停安全阀：涨幅≥9% 高位持有 / 跌幅≤-9% 低位观望(橙)\n② 趋势门控：仅强势(价≥MA10)才给低吸\n③ BIAS 乖离率：离MA10过远(超买)否决低吸、超买滞涨可高抛\n悬停单元格看判定依据",
+            11: "我的做T策略：手动下拉选择\n开盘回踩买进(强势,红) | 拉高卖出下跌买入(震荡分歧,黑) | 开盘拉高卖出(弱势,绿)",
         }
         for col, tip in tooltips.items():
             item = self.table.horizontalHeaderItem(col)
@@ -3147,14 +3213,14 @@ class MainWindow(QMainWindow):
     def _insert_row(self, code):
         r = self.table.rowCount()
         self.table.insertRow(r)
-        # 文本列 0~9（代码+7个数据列+趋势做T策略+实时做T），第10列下拉框，第11列排序按钮
-        for c, text in enumerate([code, "--", "--", "--", "--", "--", "--", "--", "--", "--"]):
+        # 文本列 0~10（代码+7个数据列+趋势做T+实时做T+实时做T2），第11列下拉框，第12列排序按钮
+        for c, text in enumerate([code, "--", "--", "--", "--", "--", "--", "--", "--", "--", "--"]):
             self.table.setItem(r, c, QTableWidgetItem(text))
         self._set_t_strategy_combo(r, code)
         self._set_sort_buttons(r)
 
     def _set_t_strategy_combo(self, row, code):
-        """第10列"我的做T策略"下拉框，选项文本带对应字体色，选择后按股票代码持久化"""
+        """第11列"我的做T策略"下拉框，选项文本带对应字体色，选择后按股票代码持久化"""
         combo = QComboBox()
         for text, _color in T_STRATEGY_OPTIONS:
             combo.addItem(text)
@@ -3165,7 +3231,7 @@ class MainWindow(QMainWindow):
         combo.currentIndexChanged.connect(
             lambda idx, c=combo: self._on_t_strategy_changed(c, idx)
         )
-        self.table.setCellWidget(row, 10, combo)
+        self.table.setCellWidget(row, 11, combo)
 
     def _apply_combo_color(self, combo, idx):
         """把下拉框当前选项的字体色应用到显示"""
@@ -3177,7 +3243,7 @@ class MainWindow(QMainWindow):
         self._apply_combo_color(combo, idx)
         # 定位该下拉框所在行的股票代码并持久化
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 10) is combo:
+            if self.table.cellWidget(r, 11) is combo:
                 code = self.table.item(r, 0).text()
                 self.config.setdefault("t_strategy", {})[code] = idx
                 save_config(self.config)
@@ -3272,11 +3338,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(btn_up)
         lay.addWidget(btn_dn)
         lay.addWidget(btn_drag)
-        self.table.setCellWidget(row, 11, w)
+        self.table.setCellWidget(row, 12, w)
 
     def _widget_row(self, widget):
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 11) == widget:
+            if self.table.cellWidget(r, 12) == widget:
                 return r
         return -1
 
@@ -3284,15 +3350,15 @@ class MainWindow(QMainWindow):
         target = row + direction
         if target < 0 or target >= self.table.rowCount():
             return
-        # 交换文本列（0~9，含实时做T）
-        for c in range(10):
+        # 交换文本列（0~10，含实时做T / 实时做T2）
+        for c in range(11):
             a = self.table.takeItem(row, c)
             b = self.table.takeItem(target, c)
             self.table.setItem(row, c, b)
             self.table.setItem(target, c, a)
-        # 交换"我的做T策略"下拉框的选择（第10列是 cellWidget，不能 takeItem）
-        cb_a = self.table.cellWidget(row, 10)
-        cb_b = self.table.cellWidget(target, 10)
+        # 交换"我的做T策略"下拉框的选择（第11列是 cellWidget，不能 takeItem）
+        cb_a = self.table.cellWidget(row, 11)
+        cb_b = self.table.cellWidget(target, 11)
         if cb_a is not None and cb_b is not None:
             ia, ib = cb_a.currentIndex(), cb_b.currentIndex()
             cb_a.setCurrentIndex(ib)
@@ -3303,9 +3369,9 @@ class MainWindow(QMainWindow):
     def _drag_move_row(self, src, dst):
         if src == dst:
             return
-        # 取出源行文本列（0~9，含实时做T）和"我的做T策略"下拉框的选择值
-        items = [self.table.takeItem(src, c) for c in range(10)]
-        cb = self.table.cellWidget(src, 10)
+        # 取出源行文本列（0~10，含实时做T / 实时做T2）和"我的做T策略"下拉框的选择值
+        items = [self.table.takeItem(src, c) for c in range(11)]
+        cb = self.table.cellWidget(src, 11)
         t_idx = cb.currentIndex() if cb is not None else 0
         code = items[0].text() if items[0] else ""
         self.table.removeRow(src)
@@ -3315,7 +3381,7 @@ class MainWindow(QMainWindow):
         for c, item in enumerate(items):
             self.table.setItem(insert_at, c, item)
         self._set_t_strategy_combo(insert_at, code)
-        new_cb = self.table.cellWidget(insert_at, 10)
+        new_cb = self.table.cellWidget(insert_at, 11)
         if new_cb is not None:
             new_cb.setCurrentIndex(t_idx)
         self._set_sort_buttons(insert_at)
@@ -3540,9 +3606,13 @@ class MainWindow(QMainWindow):
             else:
                 t_text, t_fg = "积极卖出", QColor("#27ae60")
 
-            # ── 实时做T（盘中买卖点，均价中枢+区间位置+量能/趋势过滤）──
+            # ── 实时做T v1（盘中买卖点，均价中枢+区间位置+量能/趋势过滤）──
             t_rt_text, t_rt_hex, t_rt_tip = compute_t_signal(price, ma10, intraday)
             t_rt_fg = QColor(t_rt_hex) if t_rt_hex else None
+
+            # ── 实时做T2 v2（Phase1：涨跌停安全阀+趋势门控+BIAS）──
+            t_rt2_text, t_rt2_hex, t_rt2_tip = compute_t_signal_v2(price, ma10, change_pct, intraday)
+            t_rt2_fg = QColor(t_rt2_hex) if t_rt2_hex else None
 
             bg = QColor("#ffffff")
             chg_fg = QColor("#e74c3c") if change_pct > 0 else (QColor("#27ae60") if change_pct < 0 else None)
@@ -3557,6 +3627,7 @@ class MainWindow(QMainWindow):
                 7: (act_text, act_fg),
                 8: (t_text, t_fg),
                 9: (t_rt_text, t_rt_fg),
+                10: (t_rt2_text, t_rt2_fg),
             }
             for c, (text, fg) in updates.items():
                 item = QTableWidgetItem(text)
@@ -3564,7 +3635,8 @@ class MainWindow(QMainWindow):
                 if fg:
                     item.setForeground(fg)
                 self.table.setItem(r, c, item)
-            self.table.item(r, 9).setToolTip(t_rt_tip)   # 实时做T：判定依据全在悬停里
+            self.table.item(r, 9).setToolTip(t_rt_tip)    # 实时做T v1：判定依据全在悬停里
+            self.table.item(r, 10).setToolTip(t_rt2_tip)  # 实时做T2 v2：判定依据全在悬停里
             self.table.item(r, 0).setBackground(bg)
 
             # 同步浮窗（含实时做T信号符号）
@@ -3618,7 +3690,7 @@ class MainWindow(QMainWindow):
                 item.setForeground(QColor("#999999"))
                 item.setToolTip(msg)
                 self.table.setItem(r, 1, item)   # 写入"名称"列（文本列），不覆盖数据列
-                for c in range(2, 10):           # 数据列(2~9,含实时做T)清空；第10列是用户手动策略下拉，不动
+                for c in range(2, 11):           # 数据列(2~10,含实时做T/做T2)清空；第11列是用户手动策略下拉，不动
                     self.table.setItem(r, c, QTableWidgetItem("--"))
                 break
 
