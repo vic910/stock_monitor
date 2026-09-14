@@ -197,11 +197,10 @@ function computeTSignal(price, ma10, intr){
 // 实时做T2（v2，Phase1）：v1 判定 + 涨跌停安全阀 + 趋势门控(价≥MA10) + BIAS 乖离率
 // 只返回 text/cls（买卖参考价与 v1 相同，由 v1 那格显示，这里不重复）
 function computeTSignalV2(price, ma10, change_pct, intr){
-  if(!isTradingTime()) return {text:"-", cls:"flat"};
-  if(!intr) return {text:"-", cls:"flat"};
+  if(!intr) return {text:"-", cls:"flat", buy:null, sell:null};
   const high = intr.high, low = intr.low, prev = intr.prev_close;
   const amount = intr.amount, volume = intr.volume, vr = intr.vol_ratio;
-  if(!high || !low || high <= 0 || low <= 0 || high < low) return {text:"-", cls:"flat"};
+  if(!high || !low || high <= 0 || low <= 0 || high < low) return {text:"-", cls:"flat", buy:null, sell:null};
   const avg = (amount && volume && volume > 0) ? amount / volume : (high + low + price) / 3;
   const denom = (prev && prev > 0) ? prev : avg;
   const amplitude = denom > 0 ? (high - low) / denom : 0;
@@ -210,19 +209,22 @@ function computeTSignalV2(price, ma10, change_pct, intr){
   const pos = high > low ? (price - low) / (high - low) : 0.5;
   const bias10 = ma10 ? (price - ma10) / ma10 : 0;
   const strong = ma10 ? (price >= ma10) : true;
-  // ① 涨跌停安全阀
-  if(change_pct != null && change_pct >= 9.0)  return {text:"高持", cls:"warn"};
-  if(change_pct != null && change_pct <= -9.0) return {text:"低观", cls:"warn"};
-  const priceLow  = dev <= -k || pos <= 0.20;
-  const priceHigh = dev >= k  || pos >= 0.80 || bias10 >= 0.06;   // ③ 超买也可高抛
+  const kBuy  = strong ? k * 0.4 : k * 1.6;
+  const kSell = strong ? k * 1.6 : k * 0.4;
+  const buyRef = avg * (1 - kBuy), sellRef = avg * (1 + kSell);
+  if(!isTradingTime()) return {text:"-", cls:"flat", buy:buyRef, sell:sellRef};
+  if(change_pct != null && change_pct >= 9.0)  return {text:"高持", cls:"warn", buy:buyRef, sell:sellRef};
+  if(change_pct != null && change_pct <= -9.0) return {text:"低观", cls:"warn", buy:buyRef, sell:sellRef};
+  const priceLow  = dev <= -kBuy  || pos <= 0.20;
+  const priceHigh = dev >= kSell || pos >= 0.80 || bias10 >= 0.06;
   const steady = price > low * 1.001;
   const stall  = price < high * 0.999;
   const dump   = pos <= 0.10 && vr != null && vr >= 2.0;
-  const buyOk  = priceLow && steady && !dump && strong && bias10 <= 0.06;  // ② 趋势门控 + ③ 非超买
+  const buyOk  = priceLow && steady && !dump && strong && bias10 <= 0.06;
   const sellOk = priceHigh && stall;
-  if(buyOk)  return {text:"低吸", cls:"up"};
-  if(sellOk) return {text:"高抛", cls:"down"};
-  return {text:"持有", cls:"flat"};
+  if(buyOk)  return {text:"低吸", cls:"up", buy:buyRef, sell:sellRef};
+  if(sellOk) return {text:"高抛", cls:"down", buy:buyRef, sell:sellRef};
+  return {text:"持有", cls:"flat", buy:buyRef, sell:sellRef};
 }
 
 // ── 拉实时行情（批量，gbk 解码）───────────────────────────────
@@ -305,14 +307,18 @@ function render(items){
     const bs = it.sig.buy != null
       ? `<div class="lv"><span class="up">买 ${fmt(it.sig.buy)}</span><span class="down">卖 ${fmt(it.sig.sell)}</span></div>`
       : "";
+    const bs2 = it.sig2.buy != null
+      ? `<div class="lv"><span class="up">买 ${fmt(it.sig2.buy)}</span><span class="down">卖 ${fmt(it.sig2.sell)}</span></div>`
+      : "";
     return `<div class="row${open}" data-sec="${it.secid}">
       <div class="name"><div class="nm">${it.name}</div><div class="cd">${it.secid.slice(2)}</div></div>
       <div class="price"><div class="pr ${chCls}">${it.price!=null?fmt(it.price):"--"}</div>
         <div class="ch ${chCls}">${chTxt}</div></div>
       <div class="sigcol">
         <div class="sig ${it.sig.cls}">${it.sig.text}</div>
-        <div class="sig2 ${it.sig2.cls}"><span class="tag">T2</span> ${it.sig2.text}</div>
         ${bs}
+        <div class="sig2 ${it.sig2.cls}"><span class="tag">T2</span> ${it.sig2.text}</div>
+        ${bs2}
       </div>
       <div class="detail">${it.sig.tip.replace(/\n/g,"<br>")}
         <br><button class="rm" data-rm="${it.secid}">移除</button></div>
