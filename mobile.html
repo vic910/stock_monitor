@@ -56,6 +56,11 @@
     padding:3px 8px; border-radius:8px; background:var(--card2); opacity:.92;
   }
   .sig2 .tag{font-size:9px; color:var(--dim); font-weight:700;}
+  .sig3{
+    text-align:center; font-size:12px; font-weight:600;
+    padding:3px 8px; border-radius:8px; background:var(--card2); opacity:.92;
+  }
+  .sig3 .tag{font-size:9px; color:var(--dim); font-weight:700;}
   .up{color:var(--red);} .down{color:var(--green);} .flat{color:var(--gray);} .warn{color:#ffa94d;}
   .detail{
     grid-column:1/-1; margin-top:6px; padding-top:10px;
@@ -227,6 +232,58 @@ function computeTSignalV2(price, ma10, change_pct, intr){
   return {text:"持有", cls:"flat", buy:buyRef, sell:sellRef};
 }
 
+// ── 精准做T（分时形态：分钟KDJ + 拐头 + 背离）──────────────
+async function fetchM1(secid){
+  const url = "https://web.ifzq.gtimg.cn/appstock/app/kline/mkline?param=" + secid + ",m1,,320";
+  const txt = await (await fetch(url, {cache:"no-store"})).text();
+  const j = JSON.parse(txt.slice(txt.indexOf("{")));
+  const m1 = (((j.data||{})[secid])||{}).m1 || [];
+  const bars = [];
+  for(const it of m1){
+    const pp = it.split(" ");
+    const c = parseFloat(pp[2]), h = parseFloat(pp[3]), l = parseFloat(pp[4]);
+    if(!isNaN(c) && !isNaN(h) && !isNaN(l)) bars.push({c, h, l});
+  }
+  return bars;
+}
+function kdjSeries(bars, n){
+  n = n || 9;
+  let K = 50, D = 50; const out = [];
+  for(let i = 0; i < bars.length; i++){
+    let lo = Infinity, hi = -Infinity;
+    for(let x = Math.max(0, i-n+1); x <= i; x++){ if(bars[x].l < lo) lo = bars[x].l; if(bars[x].h > hi) hi = bars[x].h; }
+    const rsv = hi > lo ? (bars[i].c - lo)/(hi - lo)*100 : 50;
+    K = 2/3*K + 1/3*rsv;
+    D = 2/3*D + 1/3*K;
+    out.push([K, D, 3*K-2*D]);
+  }
+  return out;
+}
+// 精准买卖点：买=超卖K<30+不创新低+回升+均价下方；卖对称；底/顶背离标"强"
+function computePreciseSignal(bars, avg){
+  if(!isTradingTime()) return {text:"-", cls:"flat"};
+  if(!bars || bars.length < 6) return {text:"-", cls:"flat"};
+  const kd = kdjSeries(bars);
+  const i = bars.length - 1;
+  const Kc = kd[i][0];
+  const c = bars[i].c, pc = bars[i-1].c;
+  let p3lo = Infinity, p3hi = -Infinity;
+  for(let x = i-3; x < i; x++){ if(bars[x].l < p3lo) p3lo = bars[x].l; if(bars[x].h > p3hi) p3hi = bars[x].h; }
+  if(Kc < 30 && bars[i].l >= p3lo && c > pc && (!avg || c <= avg)){
+    const s0 = Math.max(0, i-10);
+    let mi = s0; for(let x = s0; x <= i; x++) if(bars[x].l < bars[mi].l) mi = x;
+    const strong = bars[i].l <= bars[mi].l && Kc > kd[mi][0];
+    return {text: strong ? "买强" : "买", cls:"up"};
+  }
+  if(Kc > 70 && bars[i].h <= p3hi && c < pc && (!avg || c >= avg)){
+    const s0 = Math.max(0, i-10);
+    let xi = s0; for(let x = s0; x <= i; x++) if(bars[x].h > bars[xi].h) xi = x;
+    const strong = bars[i].h >= bars[xi].h && Kc < kd[xi][0];
+    return {text: strong ? "卖强" : "卖", cls:"down"};
+  }
+  return {text:"-", cls:"flat"};
+}
+
 // ── 拉实时行情（批量，gbk 解码）───────────────────────────────
 async function fetchQuotes(secids){
   const url = "https://qt.gtimg.cn/q=" + secids.join(",");
@@ -319,6 +376,7 @@ function render(items){
         ${bs}
         <div class="sig2 ${it.sig2.cls}"><span class="tag">T2</span> ${it.sig2.text}</div>
         ${bs2}
+        <div class="sig3 ${it.sig3.cls}"><span class="tag">精</span> ${it.sig3.text}</div>
       </div>
       <div class="detail">${it.sig.tip.replace(/\n/g,"<br>")}
         <br><button class="rm" data-rm="${it.secid}">移除</button></div>
@@ -347,10 +405,14 @@ async function tick(){
         if(!q || q.price == null){ items.push({secid, error:true}); continue; }
         let ma10 = null;
         try{ ma10 = await fetchMA10(secid, q.price); }catch(e){ ma10 = null; }
+        let bars3 = [];
+        try{ bars3 = await fetchM1(secid); }catch(e){ bars3 = []; }
+        const avg3 = (q.intr && q.intr.amount && q.intr.volume) ? q.intr.amount/q.intr.volume : null;
         items.push({
           secid, name:q.name, price:q.price, change_pct:q.change_pct,
           sig: computeTSignal(q.price, ma10, q.intr),
-          sig2: computeTSignalV2(q.price, ma10, q.change_pct, q.intr)
+          sig2: computeTSignalV2(q.price, ma10, q.change_pct, q.intr),
+          sig3: computePreciseSignal(bars3, avg3)
         });
       }
       render(items);
